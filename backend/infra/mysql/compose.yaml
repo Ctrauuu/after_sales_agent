@@ -1,0 +1,63 @@
+services:
+  mysql:
+    image: mysql:8.0.45
+    container_name: suning-mysql
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:3306:3306"
+
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+
+    volumes:
+      - suning_mysql_data:/var/lib/mysql
+
+    healthcheck:
+      test:
+        - CMD
+        - mysqladmin
+        - ping
+        - -h
+        - localhost
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: suning-redis
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:6380:6379"
+
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+
+    volumes:
+      - suning_redis_data:/data
+
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  suning_mysql_data:
+  suning_redis_data:

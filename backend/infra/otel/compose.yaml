@@ -1,0 +1,10 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector:0.157.0
+    container_name: suning-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4318:4318"
