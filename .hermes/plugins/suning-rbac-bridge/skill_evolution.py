@@ -16,7 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,263 @@ class SkillDefinition:
     updated_at: datetime
     usage_count: int = 0
     avg_quality_score: float = 0.0
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class RouteResult:
+    """一次语义路由的可观测结果。"""
+
+    skill_id: str | None
+    confidence: float
+    method: str
+    latency_ms: float
+
+
+@dataclass
+class _SemanticRoute:
+    """已注册 Skill 的归一化重心向量及命中统计。"""
+
+    skill: SkillDefinition
+    centroid: list[float]
+    patterns: tuple[str, ...]
+    vectors: list[list[float]]
+    hit_count: int = 0
+    last_hit: float = 0.0
+
+
+class SemanticRouter:
+    """用已注册 Skill 触发语句的 Embedding 重心做快速路由。"""
+
+    CONFIDENCE_THRESHOLD = 0.85
+
+    def __init__(self, embedder: Any, confidence_threshold: float = CONFIDENCE_THRESHOLD) -> None:
+        """输入：同步 Embedding 客户端 ``embedder`` 与可选置信度阈值 ``confidence_threshold``。
+
+        输出：初始化空的内存路由索引，不执行网络调用。
+        功能：保存轻量向量依赖和阈值，供每轮消息在 LLM 意图规划前进行 Top-1 匹配。
+        """
+
+        self._embedder = embedder
+        self._confidence_threshold = confidence_threshold
+        self._routes: dict[str, _SemanticRoute] = {}
+        self._signature: tuple[tuple[str, int, bool, tuple[str, ...]], ...] = ()
+        self._lock = threading.RLock()
+
+    def warm(self, skills: list[SkillDefinition]) -> None:
+        """输入：启动阶段或后台更新时加载的 ``skills``。
+
+        输出：无；在内存中完成当前 Skill 的向量索引构建。
+        功能：把触发语句 Embedding 从用户请求路径前移到 Gateway 启动和 Skill 演进后台，避免首条消息等待索引预热。
+        """
+
+        with self._lock:
+            self._sync(skills)
+
+    def route(
+        self,
+        query: str,
+        skills: list[SkillDefinition],
+        available_tools: set[str],
+    ) -> RouteResult:
+        """输入：本轮问题 ``query``、已加载 Skills 及可调用工具集合 ``available_tools``。
+
+        输出：高置信度时返回 ``embedding`` 命中的 Skill；否则返回 ``fallback`` 且 Skill 为空。
+        功能：先匹配规范化后的具体触发语句，再以重心或最近样本的余弦相似度选择 Top-1，并在依赖工具不可用时提前排除旧工作流。
+        """
+
+        started_at = time.monotonic()
+        normalized_query = self._normalize(query)
+        if len(self._intent_terms(normalized_query)) < 2:
+            logger.info("语义路由回退: reason=insufficient_intent_terms")
+            return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
+        try:
+            self.warm(skills)
+        except Exception:
+            logger.warning("语义路由 Embedding 不可用，回退 LLM")
+            return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
+        candidates = [
+            route
+            for route in self._routes.values()
+            if route.skill.enabled
+            and set(route.skill.required_mcp_tools).issubset(available_tools)
+        ]
+        if not candidates:
+            logger.info("语义路由回退: reason=no_available_skill")
+            return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
+        exact = next((route for route in candidates if normalized_query in route.patterns), None)
+        if exact is not None:
+            exact.hit_count += 1
+            exact.last_hit = time.time()
+            latency_ms = (time.monotonic() - started_at) * 1000
+            logger.info(
+                "语义路由命中: skill_id=%s confidence=1.00 latency_ms=%.1f source=pattern",
+                exact.skill.skill_id,
+                latency_ms,
+            )
+            return RouteResult(exact.skill.skill_id, 1.0, "embedding", latency_ms)
+        try:
+            vector = self._unit_vector(self._embed(normalized_query))
+        except Exception:
+            logger.warning("语义路由 Embedding 不可用，回退 LLM")
+            return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
+        scored = [
+            (
+                route,
+                max(
+                    self._cosine_similarity(route.centroid, vector),
+                    *(self._cosine_similarity(pattern_vector, vector) for pattern_vector in route.vectors),
+                ),
+            )
+            for route in candidates
+        ]
+        best, confidence = max(scored, key=lambda item: item[1])
+        if confidence < self._confidence_threshold:
+            logger.info("语义路由回退: reason=low_confidence confidence=%.2f", confidence)
+            return RouteResult(None, confidence, "fallback", (time.monotonic() - started_at) * 1000)
+        best.hit_count += 1
+        best.last_hit = time.time()
+        latency_ms = (time.monotonic() - started_at) * 1000
+        logger.info(
+            "语义路由命中: skill_id=%s confidence=%.2f latency_ms=%.1f source=embedding",
+            best.skill.skill_id,
+            confidence,
+            latency_ms,
+        )
+        return RouteResult(
+            best.skill.skill_id,
+            confidence,
+            "embedding",
+            latency_ms,
+        )
+
+    def _sync(self, skills: list[SkillDefinition]) -> None:
+        """输入：本轮从 Skills Hub 加载的 ``skills``。
+
+        输出：无；Skill 标识、版本或触发语句变更时原地重建内存重心索引。
+        功能：只让具备明确业务边界的触发语句参与重心和样本索引，使新 Skill 自动在下一轮可路由且未变化时不重复调用 Embedding 服务。
+        """
+
+        signature = tuple(
+            (skill.skill_id, skill.version, skill.enabled, tuple(skill.trigger_patterns))
+            for skill in skills
+        )
+        if signature == self._signature:
+            return
+        routes: dict[str, _SemanticRoute] = {}
+        for skill in skills:
+            patterns = tuple(
+                normalized
+                for pattern in skill.trigger_patterns
+                if self._is_specific_pattern(normalized := self._normalize(pattern))
+            )
+            vectors = self._embed_many(patterns)
+            if not vectors:
+                continue
+            dimension = len(vectors[0])
+            if not dimension or any(len(vector) != dimension for vector in vectors):
+                continue
+            centroid = self._unit_vector(
+                [sum(vector[index] for vector in vectors) / len(vectors) for index in range(dimension)]
+            )
+            previous = self._routes.get(skill.skill_id)
+            routes[skill.skill_id] = _SemanticRoute(
+                skill,
+                centroid,
+                patterns,
+                vectors,
+                previous.hit_count if previous else 0,
+                previous.last_hit if previous else 0.0,
+            )
+        self._routes = routes
+        self._signature = signature
+
+    def _embed_many(self, texts: Sequence[str]) -> list[list[float]]:
+        """输入：需要批量向量化的触发语句 ``texts``。
+
+        输出：与输入顺序对应的有效向量列表；客户端结果非法时抛出 ``ValueError``。
+        功能：优先复用现有 DashScope 批量接口，旧的单条客户端则保持兼容地逐条调用。
+        """
+
+        if hasattr(self._embedder, "embed_many"):
+            result = self._embedder.embed_many(list(texts))
+            if inspect.isawaitable(result):
+                raise ValueError("同步语义路由不支持异步 Embedding 客户端")
+            vectors = [[float(value) for value in vector] for vector in result]
+            if len(vectors) != len(texts):
+                raise ValueError("Embedding 返回数量与输入不一致")
+            if any(not vector or not all(math.isfinite(value) for value in vector) for vector in vectors):
+                raise ValueError("Embedding 向量无效")
+            return vectors
+        return [self._embed(text) for text in texts]
+
+    @staticmethod
+    def _normalize(value: Any) -> str:
+        """输入：用户消息或 Skill 触发语句 ``value``。
+
+        输出：移除 IM ``@提及``、首尾标点和多余空白后的文本。
+        功能：让飞书等平台附加的机器人提及不影响与已注册触发语句的精确或向量匹配。
+        """
+
+        return re.sub(r"@\S+", "", _text(value, 1000)).strip(" ，。！？!?；;：:")
+
+    @staticmethod
+    def _intent_terms(value: str) -> set[str]:
+        """输入：已规范化的用户消息或触发语句 ``value``。
+
+        输出：其中出现的业务意图词集合。
+        功能：以既有退单、售后和统计词表识别可安全直接路由的具体业务表达。
+        """
+
+        return {term for term in _TRIGGER_TERMS if term in value}
+
+    @classmethod
+    def _is_specific_pattern(cls, pattern: str) -> bool:
+        """输入：已规范化的 Skill 触发语句 ``pattern``。
+
+        输出：至少包含两个业务意图词时返回 ``True``。
+        功能：排除“帮我看看最近的情况”类无业务边界的历史样本，避免其污染 Skill 重心并造成误路由。
+        """
+
+        return len(cls._intent_terms(pattern)) >= 2
+
+    def _embed(self, text: str) -> list[float]:
+        """输入：待向量化的触发语句或用户问题 ``text``。
+
+        输出：有限浮点数组成的同步 Embedding 向量；客户端返回协程、空值或非有限值时抛出 ``ValueError``。
+        功能：在同步 Hermes 回答前 Hook 中统一校验 DashScope Embedding 响应，避免坏向量污染整个索引。
+        """
+
+        result = self._embedder.embed(text)
+        if inspect.isawaitable(result):
+            raise ValueError("同步语义路由不支持异步 Embedding 客户端")
+        vector = [float(value) for value in result]
+        if not vector or not all(math.isfinite(value) for value in vector):
+            raise ValueError("Embedding 向量无效")
+        return vector
+
+    @staticmethod
+    def _unit_vector(vector: list[float]) -> list[float]:
+        """输入：有限浮点数组成的 ``vector``。
+
+        输出：L2 归一化向量；零向量时抛出 ``ValueError``。
+        功能：把触发语句重心和查询向量规范到同一尺度，使点积等价于余弦相似度。
+        """
+
+        norm = math.sqrt(sum(value * value for value in vector))
+        if not norm:
+            raise ValueError("Embedding 向量不能为零")
+        return [value / norm for value in vector]
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        """输入：两个已归一化的向量 ``left`` 与 ``right``。
+
+        输出：维度相同则返回余弦相似度；维度不同返回 ``-1``。
+        功能：使用标准库点积完成候选 Skill 排序，不引入 NumPy 运行时依赖。
+        """
+
+        return sum(a * b for a, b in zip(left, right)) if len(left) == len(right) else -1.0
 
 
 def _text(value: Any, limit: int = 2000) -> str:
@@ -187,6 +444,7 @@ def _skill_from_payload(payload: Mapping[str, Any]) -> SkillDefinition | None:
             updated_at=updated_at,
             usage_count=max(0, int(payload.get("usage_count", 0))),
             avg_quality_score=max(0.0, min(1.0, float(payload.get("avg_quality_score", 0.0)))),
+            enabled=bool(payload.get("enabled", True)),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -437,6 +695,8 @@ class SkillEvolutionEngine:
         if not normalized_query:
             return None
         for skill in self.load_all_skills():
+            if not skill.enabled:
+                continue
             if not set(skill.required_mcp_tools).issubset(available_tools):
                 continue
             if any(_pattern_matches(pattern, normalized_query) for pattern in skill.trigger_patterns):
@@ -479,11 +739,12 @@ class SkillEvolutionHooks:
         """输入：已装配的自进化 ``engine`` 与允许调用的 MCP 工具 ``available_tools``。
 
         输出：初始化可注册的 Hook 对象，不读取文件或调用模型。
-        功能：保存一轮内的工具轨迹，并限制自动 Skill 只能引用插件实际暴露的工具。
+        功能：保存一轮内的工具轨迹、语义路由索引，并限制自动 Skill 只能引用插件实际暴露的工具。
         """
 
         self._engine = engine
         self._available_tools = set(available_tools)
+        self._router = SemanticRouter(engine._embedder)
         self._turns: dict[tuple[str, str], _TrackedTurn] = {}
         self._lock = threading.RLock()
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -493,13 +754,22 @@ class SkillEvolutionHooks:
         )
         self._futures: set[Future[Any]] = set()
 
+    def warm(self) -> None:
+        """输入：隐式读取当前 Skills Hub 内容。
+
+        输出：无；当前 Skill 的触发语句向量索引被预热，失败时抛出 Embedding 或文件读取异常。
+        功能：供 Gateway 启动和自进化后台在无用户请求时刷新语义路由索引。
+        """
+
+        self._router.warm(self._engine.load_all_skills())
+
     def pre_llm_call(
         self, *, session_id: str = "", turn_id: str = "", user_message: Any = "", **_kwargs: Any
     ) -> dict[str, str] | None:
         """输入：逻辑会话、轮次、用户消息及其他 Hermes 生命周期字段。
 
-        输出：命中且预检查通过的 Skill 执行上下文；未命中或工具不可用时返回 ``None``。
-        功能：开始采集本轮轨迹，并让 Agent 直接加载验证过的工作流；失效 Skill 自动降级。
+        输出：语义相似度达到阈值且预检查通过的 Skill 执行上下文；低置信度、未命中或工具不可用时返回 ``None``。
+        功能：开始采集本轮轨迹，以 Embedding 路由直达验证过的工作流，并让低置信度请求继续由 LLM 规划。
         """
 
         session = _text(session_id, 200)
@@ -510,13 +780,16 @@ class SkillEvolutionHooks:
                 self._turns[(session, turn)] = _TrackedTurn(query, time.monotonic())
                 while len(self._turns) > MAX_TRACKED_TURNS:
                     self._turns.pop(next(iter(self._turns)))
-        skill = self._engine.match(query, self._available_tools)
+        skills = self._engine.load_all_skills()
+        route = self._router.route(query, skills, self._available_tools)
+        skill = next((item for item in skills if item.skill_id == route.skill_id), None)
         if skill is None:
             return None
         workflow = json.dumps(skill.workflow, ensure_ascii=False)
         return {
             "context": (
-                f"已匹配并通过 MCP 依赖预检查的 Skill：{skill.name}（v{skill.version}）。\n"
+                f"已通过语义路由并完成 MCP 依赖预检查的 Skill：{skill.name}（v{skill.version}，"
+                f"置信度 {route.confidence:.2f}）。\n"
                 f"按以下工作流顺序执行；将 {{变量}} 替换为本轮问题的值，只使用列出的工具：{workflow}\n"
                 f"输出格式：{skill.output_template or '基于各步骤结果给出结论和数据依据。'}"
             )
@@ -580,12 +853,13 @@ class SkillEvolutionHooks:
     async def _evolve(self, trace: ExecutionTrace) -> None:
         """输入：已经通过复杂度门禁的 ``ExecutionTrace``。
 
-        输出：无；创建、更新或跳过 Skill，故障只记录日志。
+        输出：无；创建、更新或跳过 Skill，更新成功后刷新路由索引，故障只记录日志。
         功能：作为后台任务边界隔离 LLM、Embedding 和文件系统异常，保证正常对话生命周期可靠完成。
         """
 
         try:
-            await self._engine.evaluate_and_evolve(trace)
+            if await self._engine.evaluate_and_evolve(trace) is not None:
+                self.warm()
         except Exception:
             logger.exception("Skill 自进化失败")
 
@@ -602,8 +876,8 @@ class SkillEvolutionHooks:
 def build_skill_evolution_hooks(llm: Any, available_tools: set[str]) -> SkillEvolutionHooks:
     """输入：宿主 LLM ``llm`` 与插件实际暴露的 MCP 工具集合 ``available_tools``。
 
-    输出：使用 DashScope Embedding 的 ``SkillEvolutionHooks``；禁用或缺少密钥时抛出 ``RuntimeError``。
-    功能：从环境变量装配自动 Skill 存储和语义去重依赖，使插件可按配置独立启用此闭环。
+    输出：已尝试预热路由索引的 ``SkillEvolutionHooks``；禁用或缺少密钥时抛出 ``RuntimeError``。
+    功能：从环境变量装配自动 Skill 存储和语义去重依赖，并把当前触发语句 Embedding 前移到 Gateway 启动阶段。
     """
 
     if os.getenv("SKILL_EVOLUTION_ENABLED", "true").strip().lower() in {"0", "false", "no"}:
@@ -621,12 +895,19 @@ def build_skill_evolution_hooks(llm: Any, available_tools: set[str]) -> SkillEvo
         if configured_dir
         else Path(__file__).resolve().parents[2] / "skills" / "evolved"
     )
-    return SkillEvolutionHooks(SkillEvolutionEngine(llm, skills_dir, embedder), available_tools)
+    hooks = SkillEvolutionHooks(SkillEvolutionEngine(llm, skills_dir, embedder), available_tools)
+    try:
+        hooks.warm()
+    except Exception:
+        logger.exception("Skill 语义路由预热失败，将在后续请求重试")
+    return hooks
 
 
 __all__ = [
     "EVOLUTION_COMPLEXITY_THRESHOLD",
     "ExecutionTrace",
+    "RouteResult",
+    "SemanticRouter",
     "SIMILARITY_THRESHOLD",
     "SkillDefinition",
     "SkillEvolutionEngine",

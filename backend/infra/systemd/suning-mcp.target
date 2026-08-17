@@ -1,0 +1,12 @@
+[Unit]
+Description=All Suning MCP services
+Wants=suning-mcp@order.service
+Wants=suning-mcp@aftersale.service
+Wants=suning-mcp@product.service
+Wants=suning-mcp@logistics.service
+Wants=suning-mcp@payment.service
+Wants=suning-mcp@timeline.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

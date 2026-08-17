@@ -66,8 +66,8 @@ Hermes Gateway 请求级身份
 关键文件：
 
 - `.hermes/plugins/suning-rbac-bridge/bridge.py`：读取 Hermes 会话身份并签发短期凭证
-- `backend/mcp_suning/auth_attestation.py`：验签、有效期、工具绑定和 Redis 防重放
-- `backend/mcp_suning/auth_middleware.py`：用户映射、角色/用户范围求交、群聊降权
+- `backend/mcp_suning/security/attestation.py`：验签、有效期、工具绑定和 Redis 防重放
+- `backend/mcp_suning/security/rbac.py`：用户映射、角色/用户范围求交、群聊降权
 - 五个 `*_server.py`：授权必须发生在首次 SQL 之前，并使用 `allowed_*` 构造参数化条件
 
 统一授权入口的实际调用方式：
@@ -124,8 +124,8 @@ return interceptor.mask_sensitive_data(rows, safe_filters["data_scope"])
 ```
 
 不要从模型参数、提示词或裸 `_meta` 读取工号/角色；也不要在 MCP 工具中复制一套
-角色判断。完整实现以 `bridge.py`、`auth_attestation.py`、`auth_middleware.py` 和
-五个 `*_server.py` 为准。
+角色判断。完整实现以 `bridge.py`、`security/attestation.py`、`security/rbac.py` 和
+`servers/` 下五个业务入口为准。
 ---
 
 ## 涉及业务模块

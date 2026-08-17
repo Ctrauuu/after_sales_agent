@@ -29,16 +29,30 @@ def _required_env(name: str) -> str:
     return value
 
 
-def build_conversation_runtime() -> tuple[ConversationHooks, Any, Any]:
-    """输入：隐式读取 Redis、MySQL、DeepSeek 和置信度环境变量。
+def build_redis_client() -> Any:
+    """输入：隐式读取必需的 ``REDIS_URL`` 环境变量。
 
-    输出：短期上下文 Hooks、同一 Redis 客户端和同一 MySQL Engine。
-    功能：一次装配会话槽位与身份路由共用的基础设施，避免插件为同一请求重复创建连接池。
+    输出：使用二进制响应模式的同步 Redis Client。
+    功能：集中创建插件共享的 Redis 连接池，供 Context 和 MCP 熔断复用。
     """
 
-    redis_client = redis.Redis.from_url(
+    return redis.Redis.from_url(
         _required_env("REDIS_URL"),
         decode_responses=False,
+    )
+
+
+def build_conversation_runtime(
+    redis_client: Any | None = None,
+) -> tuple[ConversationHooks, Any, Any]:
+    """输入：可选共享 Redis Client；隐式读取 MySQL、DeepSeek 和置信度环境变量。
+
+    输出：短期上下文 Hooks、同一 Redis 客户端和同一 MySQL Engine。
+    功能：一次装配会话槽位与身份路由基础设施，未注入 Client 时才创建 Redis 连接池。
+    """
+
+    resolved_redis_client = (
+        redis_client if redis_client is not None else build_redis_client()
     )
     database_url = URL.create(
         "mysql+pymysql",
@@ -66,7 +80,7 @@ def build_conversation_runtime() -> tuple[ConversationHooks, Any, Any]:
         ),
         max_tokens=600,
     )
-    manager = ContextManager(redis_client, summary_model=model)
+    manager = ContextManager(resolved_redis_client, summary_model=model)
     whitelist_loader = DatabaseWhitelistLoader(
         database_engine,
         cache_ttl_seconds=float(
@@ -80,7 +94,7 @@ def build_conversation_runtime() -> tuple[ConversationHooks, Any, Any]:
             os.getenv("CONTEXT_SLOT_CONFIDENCE_THRESHOLD", "0.7")
         ),
     )
-    return ConversationHooks(manager, extractor), redis_client, database_engine
+    return ConversationHooks(manager, extractor), resolved_redis_client, database_engine
 
 
 def build_conversation_hooks() -> ConversationHooks:
@@ -112,5 +126,6 @@ def register_context_hooks(
 __all__ = [
     "build_conversation_hooks",
     "build_conversation_runtime",
+    "build_redis_client",
     "register_context_hooks",
 ]

@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-import mcp_suning.auth_attestation as attestation
+import mcp_suning.security.attestation as attestation
 
 
 TEST_SECRET = "test-secret-with-at-least-thirty-two-bytes"

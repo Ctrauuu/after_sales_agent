@@ -1,35 +1,37 @@
 import ast
-import runpy
+import importlib.util
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 
-MCP_ROOT = Path(__file__).resolve().parents[1] / "mcp_suning"
+MCP_ROOT = Path(__file__).resolve().parents[1] / "mcp_suning" / "servers"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BRIDGE_ROOT = PROJECT_ROOT / ".hermes" / "plugins" / "suning-rbac-bridge"
 MCP_FILES = (
-    "order_server.py",
-    "aftersale_server.py",
-    "product_server.py",
-    "logistics_server.py",
-    "payment_server.py",
+    "order.py",
+    "aftersale.py",
+    "product.py",
+    "logistics.py",
+    "payment.py",
 )
-TIMELINE_MCP_FILE = "order_timeline_server.py"
+TIMELINE_MCP_FILE = "timeline.py"
 
 # 该映射直接对应 MySQL mcp_tool_registry 当前 is_enabled=1 的记录。测试会在
 # 代码层阻止未登记工具被意外暴露，也能在数据库名称调整后明确提示同步修改。
 DATABASE_TOOL_NAMES = {
-    "order_server.py": {"search_orders", "get_order_detail"},
-    "aftersale_server.py": {
+    "order.py": {"search_orders", "get_order_detail"},
+    "aftersale.py": {
         "get_aftersale_workflow",
         "query_aftersale_nl2sql",
         "query_return_stats_nl2sql",
     },
-    "product_server.py": {"get_product_info"},
-    "logistics_server.py": {"query_logistics"},
-    "payment_server.py": {"get_refund_status"},
-    "order_timeline_server.py": {"trace_order_timeline"},
+    "product.py": {"get_product_info"},
+    "logistics.py": {"query_logistics"},
+    "payment.py": {"get_refund_status"},
+    "timeline.py": {"trace_order_timeline"},
 }
 
 
@@ -150,6 +152,46 @@ def _manifest_tool_names() -> set[str]:
     return names
 
 
+def _mcp_server_tool_names() -> set[str]:
+    """输入：当前六个 MCP Server 源文件。
+
+    输出：所有 ``@mcp.tool`` 公开函数的名称集合。
+    功能：复用现有 AST 工具发现逻辑，为桥接策略一致性测试提供真实名称。
+    """
+
+    return {
+        function.name
+        for filename in (*MCP_FILES, TIMELINE_MCP_FILE)
+        for function in _tool_functions(
+            ast.parse((MCP_ROOT / filename).read_text(encoding="utf-8"))
+        )
+    }
+
+
+def _load_bridge_schemas(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """输入：pytest ``monkeypatch`` 和桥接插件目录。
+
+    输出：保留相对导入语义加载的真实 ``schemas`` 模块。
+    功能：构造临时插件 package，避免 ``run_path`` 无法解析 resilience 模块。
+    """
+
+    package_name = "_suning_rbac_bridge_wiring_test"
+    package = ModuleType(package_name)
+    package.__path__ = [str(BRIDGE_ROOT)]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, package_name, package)
+
+    module_name = f"{package_name}.schemas"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        BRIDGE_ROOT / "schemas.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.parametrize("filename", MCP_FILES)
 def test_every_public_mcp_tool_calls_authorization_before_database(filename: str) -> None:
     """输入：参数 ``filename``。
@@ -179,7 +221,11 @@ def test_every_public_mcp_tool_calls_authorization_before_database(filename: str
         database_boundary_lines: list[int] = []
         for call in direct_calls:
             called_name = _call_name(call)
-            if called_name in {"engine.connect", "nl2sql_pipeline.run"}:
+            if called_name in {
+                "engine.connect",
+                "nl2sql_lite_pipeline.run",
+                "nl2sql_pipeline.run",
+            }:
                 database_boundary_lines.append(call.lineno)
                 continue
             called = functions.get(called_name)
@@ -214,7 +260,10 @@ def test_every_public_mcp_tool_calls_authorization_before_database(filename: str
         delegated_scope_calls = [
             call
             for call in reachable_calls
-            if _call_name(call) == "nl2sql_pipeline.run"
+            if _call_name(call) in {
+                "nl2sql_lite_pipeline.run",
+                "nl2sql_pipeline.run",
+            }
         ]
         assert scope_calls or delegated_scope_calls, (
             f"{filename}:{function.name} 未注入 SQL 行级权限"
@@ -259,23 +308,57 @@ def test_exposed_tool_names_match_database_registry(filename: str) -> None:
     assert exposed_names == DATABASE_TOOL_NAMES[filename]
 
 
-def test_hermes_bridge_tool_names_match_mcp_servers() -> None:
-    """输入：MCP 工具白名单以及 Hermes 桥接插件的 schema 和清单。
+def test_hermes_bridge_tool_names_match_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：当前 MCP Server、插件清单、schema 和 ``monkeypatch``。
 
-    输出：无；名称不一致或旧工具名残留时由 pytest 报告失败。
-    功能：防止 MCP 工具改名后桥接注册表继续发布过期名称，并允许独立图表和飞书多 Agent 编排工具。
+    输出：无；名称或 resilience 策略不一致时由 pytest 报告失败。
+    功能：实现 T22，确保 MCP Tool、桥接清单与逐项调用策略完整一致。
     """
 
-    expected_names = set().union(*DATABASE_TOOL_NAMES.values())
-    schema_namespace = runpy.run_path(str(BRIDGE_ROOT / "schemas.py"))
-    schema_names = set(schema_namespace["TOOL_SPECS"])
+    server_tool_names = _mcp_server_tool_names()
+    schemas = _load_bridge_schemas(monkeypatch)
+    tool_specs = schemas.TOOL_SPECS
+    expected_policies = {
+        "search_orders": ("mcp-order", "L2_CORE", True, True),
+        "get_order_detail": ("mcp-order", "L2_CORE", True, False),
+        "query_return_stats_nl2sql": ("mcp-aftersale", "L2_CORE", True, True),
+        "query_aftersale_nl2sql": ("mcp-aftersale", "L2_CORE", True, True),
+        "get_aftersale_workflow": (
+            "mcp-aftersale",
+            "L1_NON_CRITICAL",
+            True,
+            True,
+        ),
+        "get_product_info": ("mcp-product", "L1_NON_CRITICAL", True, False),
+        "query_logistics": ("mcp-logistics", "L1_NON_CRITICAL", True, True),
+        "get_refund_status": ("mcp-payment", "L2_CORE", True, False),
+        "trace_order_timeline": (
+            "mcp-order-timeline",
+            "L2_CORE",
+            True,
+            False,
+        ),
+    }
+    actual_policies = {
+        name: (
+            tool_spec.server_id,
+            tool_spec.degrade_level.value,
+            tool_spec.retry_on_timeout,
+            tool_spec.empty_result_is_success,
+        )
+        for name, tool_spec in tool_specs.items()
+    }
 
-    assert schema_names == expected_names
-    assert _manifest_tool_names() == expected_names | {
+    assert server_tool_names == set().union(*DATABASE_TOOL_NAMES.values())
+    assert set(tool_specs) == server_tool_names
+    assert _manifest_tool_names() == server_tool_names | {
         "send_aftersale_chart",
         "orchestrate_aftersale_analysis",
     }
-    assert "query_return_stats" not in schema_names
+    assert actual_policies == expected_policies
+    assert "query_return_stats" not in tool_specs
 
 
 def test_order_timeline_aggregator_authenticates_and_masks_result() -> None:

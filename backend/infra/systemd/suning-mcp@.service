@@ -1,0 +1,24 @@
+[Unit]
+Description=Suning MCP service (%i)
+Wants=network-online.target
+After=network-online.target
+PartOf=suning-mcp.target
+
+[Service]
+Type=simple
+User=ctrau
+Group=ctrau
+WorkingDirectory=/home/ctrau/suning-hermes-agent/backend
+EnvironmentFile=/home/ctrau/suning-hermes-agent/backend/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ctrau/suning-hermes-agent/backend/.venv/bin/python -m mcp_suning.servers.%i
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0027
+SyslogIdentifier=suning-mcp-%i
+
+[Install]
+WantedBy=suning-mcp.target

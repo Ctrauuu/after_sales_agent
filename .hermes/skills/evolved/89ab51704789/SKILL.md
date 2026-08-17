@@ -15,7 +15,7 @@ description: 复用 query_return_stats_nl2sql 按品类、原因、日趋势三�
   "created_at": "2026-08-15T13:45:36.838831+00:00",
   "description": "复用 query_return_stats_nl2sql 按品类、原因、日趋势三个维度分析指定品类在指定时间窗口内的退单原因，并输出结构化结论与数据局限提示。适用于任意品类和任意近 N 天退单分析。",
   "name": "return-order-reason-analysis",
-  "output_template": "按工作流完成实时查询（4 个维度均已实际调用 `query_return_stats_nl2sql`）： ## {category} / 最近 {date_range_days} 天退单分析 **① 按品类构成** {{result_category}} **② 按退单原因** {{result_reason}} **③ 按日趋势（{category}）** {{result_trend}} **④ 全品类对照趋势（近 {date_range_days} 天）** {{result_all_trend}} --- ### 结论 1. **原因**：基于 {{result_reason}} 中的原因占比给出结构性描述；若样本量过小，需提示无统计意义，不建议据此启动质量溯源或赔付决策。 2. **趋势**：基于 {{result_trend}} 和 {{result_all_trend}} 判断是否存在尖峰或波动，并给出该品类在全部退单中的占比。 3. **数据覆盖提示**：核对返回日期跨度是否满足 {date_range_days} 天窗口；若实际覆盖天数不足，需说明为数据源未同步覆盖，并明确结论仅限定性参考。",
+  "output_template": "## 近 {date_range_days} 天退单综合分析 ### ① 按日趋势 {return_daily_trend} ### ② 按品类构成 {return_by_category} ### ③ 按退单原因 {return_by_reason} ### ④ 退款金额 - 如金额字段脱敏，需说明无法提供实时金额；否则展示退款金额汇总。 ### 结论 1. 趋势：识别峰值/异常日并说明形态。 2. 品类：占比最高的品类。 3. 原因：主要原因簇及其关联。 4. 数据覆盖：说明样本量与数据完整性限制。 ### 图表建议 | 图表 | 类型 | labels | values | 用途 | |---|---|---|---|---| | 退单量按日趋势 | 折线图 (trend) | {daily_labels} | {daily_values} | 展示趋势与峰值 | | 品类占比 | 饼图 (proportion) | {category_labels} | {category_values} | 展示品类构成 | | 原因分布 | 条形图 (bar) | {reason_labels} | {reason_values} | 展示主要原因 |",
   "required_mcp_tools": [
     "query_return_stats_nl2sql"
   ],
@@ -34,26 +34,55 @@ description: 复用 query_return_stats_nl2sql 按品类、原因、日趋势三�
     "{category}退单原因分析",
     "最近{date_range_days}天退货原因趋势",
     "退货/退单多维度分析",
-    "请分析最近30天电视退单原因，按品类、原因和趋势给出结论。"
+    "请分析最近30天电视退单原因，按品类、原因和趋势给出结论。",
+    "{category} 最近 {date_range_days} 天退单数量和原因怎么样",
+    "{category}退货趋势分析",
+    "最近 {date_range_days} 天退单情况",
+    "最近电视退单数量和原因怎么样",
+    "分析最近{date_range_days}天{category}退单原因",
+    "{category}近{date_range_days}天退单分析",
+    "{category}退单原因及趋势分析",
+    "分析最近30天空调退单原因",
+    "帮我看看最近的情况",
+    "分析一下最近的售后情况",
+    "最近退单情况怎么样",
+    "售后退单分析",
+    "请分析最近{date_range_days}天{category}退单原因，按原因、品类和趋势给出结论",
+    "分析{category}最近{date_range_days}天的退货/退单原因分布、品类分布和趋势",
+    "按原因、品类和趋势分析{category}退单情况",
+    "请分析最近30天空调退单原因，按原因、品类和趋势给出结论。@Hermes\\_agent",
+    "统计{category}近{date_range_days}天退货原因构成",
+    "分析{category}退货按日变化趋势",
+    "{category}近一个月退货原因及趋势分析",
+    "退货原因构成并分析按日趋势",
+    "请统计电视近一个月退货原因构成，并分析按日变化趋势。",
+    "帮我分析近{date_range_days}天{category}退单原因",
+    "分析{category}退货原因及占比",
+    "按原因统计退单量",
+    "退货原因多维分析",
+    "帮我分析近7天空调退单原因，按原因分组输出退单量及占比。",
+    "分析近{days}天退单趋势、主要品类、原因和退款金额",
+    "退单分析",
+    "退货/退款多维统计",
+    "按日/品类/原因分析退单数据",
+    "请分析近30天退单趋势、主要品类、原因和退款金额，并给出图表建议。"
   ],
-  "updated_at": "2026-08-15T13:54:41.089036+00:00",
-  "usage_count": 3,
-  "version": 3,
+  "updated_at": "2026-08-16T08:42:08.835786+00:00",
+  "usage_count": 10,
+  "version": 10,
   "workflow": [
     {
-      "output_key": "result_reason",
+      "output_key": "return_daily_trend",
       "params": {
-        "category": "{category}",
         "date_range_days": "{date_range_days}",
-        "group_by": "reason"
+        "group_by": "day"
       },
       "step": 1,
       "tool": "query_return_stats_nl2sql"
     },
     {
-      "output_key": "result_category",
+      "output_key": "return_by_category",
       "params": {
-        "category": "{category}",
         "date_range_days": "{date_range_days}",
         "group_by": "category"
       },
@@ -61,22 +90,12 @@ description: 复用 query_return_stats_nl2sql 按品类、原因、日趋势三�
       "tool": "query_return_stats_nl2sql"
     },
     {
-      "output_key": "result_trend",
+      "output_key": "return_by_reason",
       "params": {
-        "category": "{category}",
         "date_range_days": "{date_range_days}",
-        "group_by": "day"
+        "group_by": "reason"
       },
       "step": 3,
-      "tool": "query_return_stats_nl2sql"
-    },
-    {
-      "output_key": "result_all_trend",
-      "params": {
-        "date_range_days": "{date_range_days}",
-        "group_by": "day"
-      },
-      "step": 4,
       "tool": "query_return_stats_nl2sql"
     }
   ]

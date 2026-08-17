@@ -20,11 +20,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .mcp_resilience import DegradeLevel
+
 
 @dataclass(frozen=True)
 class ToolSpec:
     """单个业务工具对应的私有 MCP 地址与 Hermes 工具 schema。"""
 
+    server_id: str
+    degrade_level: DegradeLevel
+    retry_on_timeout: bool
+    empty_result_is_success: bool
     endpoint_env: str
     default_endpoint: str
     schema: dict[str, Any]
@@ -32,6 +38,10 @@ class ToolSpec:
 
 TOOL_SPECS: dict[str, ToolSpec] = {
     "search_orders": ToolSpec(
+        server_id="mcp-order",
+        degrade_level=DegradeLevel.L2_CORE,
+        retry_on_timeout=True,
+        empty_result_is_success=True,
         endpoint_env="SUNING_MCP_ORDER_URL",
         default_endpoint="http://127.0.0.1:8101/mcp",
         schema={
@@ -60,6 +70,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "get_order_detail": ToolSpec(
+        server_id="mcp-order",
+        degrade_level=DegradeLevel.L2_CORE,
+        retry_on_timeout=True,
+        empty_result_is_success=False,
         endpoint_env="SUNING_MCP_ORDER_URL",
         default_endpoint="http://127.0.0.1:8101/mcp",
         schema={
@@ -76,6 +90,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "query_return_stats_nl2sql": ToolSpec(
+        server_id="mcp-aftersale",
+        degrade_level=DegradeLevel.L2_CORE,
+        retry_on_timeout=True,
+        empty_result_is_success=True,
         endpoint_env="SUNING_MCP_AFTERSALE_URL",
         default_endpoint="http://127.0.0.1:8102/mcp",
         schema={
@@ -104,6 +122,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "query_aftersale_nl2sql": ToolSpec(
+        server_id="mcp-aftersale",
+        degrade_level=DegradeLevel.L2_CORE,
+        retry_on_timeout=True,
+        empty_result_is_success=True,
         endpoint_env="SUNING_MCP_AFTERSALE_URL",
         default_endpoint="http://127.0.0.1:8102/mcp",
         schema={
@@ -128,6 +150,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "get_aftersale_workflow": ToolSpec(
+        server_id="mcp-aftersale",
+        degrade_level=DegradeLevel.L1_NON_CRITICAL,
+        retry_on_timeout=True,
+        empty_result_is_success=True,
         endpoint_env="SUNING_MCP_AFTERSALE_URL",
         default_endpoint="http://127.0.0.1:8102/mcp",
         schema={
@@ -139,7 +165,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
                     "return_id": {"type": "integer", "minimum": 1},
                     "order_id": {"type": "integer", "minimum": 1},
                 },
-                "anyOf": [
+                "oneOf": [
                     {"required": ["return_id"]},
                     {"required": ["order_id"]},
                 ],
@@ -148,6 +174,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "get_product_info": ToolSpec(
+        server_id="mcp-product",
+        degrade_level=DegradeLevel.L1_NON_CRITICAL,
+        retry_on_timeout=True,
+        empty_result_is_success=False,
         endpoint_env="SUNING_MCP_PRODUCT_URL",
         default_endpoint="http://127.0.0.1:8103/mcp",
         schema={
@@ -164,6 +194,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "query_logistics": ToolSpec(
+        server_id="mcp-logistics",
+        degrade_level=DegradeLevel.L1_NON_CRITICAL,
+        retry_on_timeout=True,
+        empty_result_is_success=True,
         endpoint_env="SUNING_MCP_LOGISTICS_URL",
         default_endpoint="http://127.0.0.1:8104/mcp",
         schema={
@@ -175,7 +209,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
                     "return_id": {"type": "integer", "minimum": 1},
                     "order_id": {"type": "integer", "minimum": 1},
                 },
-                "anyOf": [
+                "oneOf": [
                     {"required": ["return_id"]},
                     {"required": ["order_id"]},
                 ],
@@ -184,6 +218,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "get_refund_status": ToolSpec(
+        server_id="mcp-payment",
+        degrade_level=DegradeLevel.L2_CORE,
+        retry_on_timeout=True,
+        empty_result_is_success=False,
         endpoint_env="SUNING_MCP_PAYMENT_URL",
         default_endpoint="http://127.0.0.1:8105/mcp",
         schema={
@@ -195,7 +233,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
                     "return_id": {"type": "integer", "minimum": 1},
                     "order_id": {"type": "integer", "minimum": 1},
                 },
-                "anyOf": [
+                "oneOf": [
                     {"required": ["return_id"]},
                     {"required": ["order_id"]},
                 ],
@@ -204,6 +242,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         },
     ),
     "trace_order_timeline": ToolSpec(
+        server_id="mcp-order-timeline",
+        degrade_level=DegradeLevel.L2_CORE,
+        retry_on_timeout=True,
+        empty_result_is_success=False,
         endpoint_env="SUNING_MCP_TIMELINE_URL",
         default_endpoint="http://127.0.0.1:8106/mcp",
         schema={

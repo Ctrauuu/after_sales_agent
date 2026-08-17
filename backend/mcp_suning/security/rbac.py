@@ -30,7 +30,7 @@ from typing import Any
 import sqlalchemy as sa
 from fastmcp import Context
 
-from mcp_suning.auth_attestation import AuthenticatedPrincipal, verify_attestation
+from mcp_suning.security.attestation import AuthenticatedPrincipal, verify_attestation
 from mcp_suning.database import engine
 from mcp_suning.domain_registry import CATEGORY_ALIASES, REGION_ALIASES
 

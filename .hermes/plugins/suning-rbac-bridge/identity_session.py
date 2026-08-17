@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
+import threading
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -14,7 +17,29 @@ TRUSTED_PLATFORMS = frozenset({"feishu", "wecom", "dingtalk"})
 DIRECT_CHAT_TYPES = frozenset({"dm", "direct", "private", "p2p"})
 GROUP_CHAT_TYPES = frozenset({"group", "channel", "forum", "thread"})
 ACTIVE_SESSION_TTL_SECONDS = 30 * 60
+TURN_LEASE_TTL_SECONDS = 5 * 60
+TURN_LEASE_WAIT_SECONDS = 0.0
+TURN_LEASE_RENEW_SECONDS = TURN_LEASE_TTL_SECONDS / 3
 UNAUTHORIZED_REPLY = "未授权用户，请联系管理员绑定账号。"
+CONCURRENT_TURN_REPLY = "该账号的跨平台会话正在处理中，请稍后重试。"
+LEASE_LOST_REPLY = "当前会话协调状态已失效，本轮结果未写入上下文，请重试。"
+
+
+logger = logging.getLogger(__name__)
+
+
+_RENEW_TURN_LEASE = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+_RELEASE_TURN_LEASE = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
 
 
 class IdentityResolutionError(PermissionError):
@@ -29,6 +54,126 @@ class SessionRoute:
     session_id: str
     platform: str
     chat_type: str
+
+
+class ConversationTurnLease:
+    """用 Redis 令牌租约串行化同一逻辑会话的完整 Agent 回合。"""
+
+    def __init__(self, redis_client: Any, session_id: str) -> None:
+        """输入：共享 Redis 客户端 ``redis_client`` 与已隔离的逻辑会话 ID ``session_id``。
+
+        输出：初始化尚未获取的、带随机所有者令牌的租约对象。
+        功能：为跨进程/跨平台的同一逻辑会话建立可比较、可续期且可安全释放的 Redis 锁状态。
+        """
+
+        self._redis = redis_client
+        self._key = f"im:turn-lease:{session_id}"
+        self._token = secrets.token_urlsafe(24)
+        self._stop_renewal = threading.Event()
+        self._lost = threading.Event()
+        self._acquired = False
+        self._released = False
+
+    def acquire(self, wait_seconds: float = TURN_LEASE_WAIT_SECONDS) -> bool:
+        """输入：等待已有同会话回合结束的最大秒数 ``wait_seconds``。
+
+        输出：获得租约返回 ``True``；超时或 Redis 协调不可用返回 ``False``。
+        功能：使用 Redis ``SET NX EX`` 原子选出唯一回合所有者，并在获得后启动自动续租以覆盖长任务。
+        """
+
+        deadline = time.monotonic() + max(wait_seconds, 0.0)
+        while True:
+            try:
+                acquired = bool(
+                    self._redis.set(
+                        self._key,
+                        self._token,
+                        ex=TURN_LEASE_TTL_SECONDS,
+                        nx=True,
+                    )
+                )
+            except Exception:
+                return False
+            if acquired:
+                self._acquired = True
+                self._start_renewal()
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+
+    def is_held(self) -> bool:
+        """输入：无；读取本租约的本地状态和 Redis 当前值。
+
+        输出：令牌仍是 Redis 锁所有者返回 ``True``，否则返回 ``False``。
+        功能：在持久化上下文或执行副作用工具前拒绝失去所有权的旧回合，防止其覆盖新回合状态。
+        """
+
+        if not self._acquired or self._released or self._lost.is_set():
+            return False
+        try:
+            held = _text(self._redis.get(self._key)) == self._token
+        except Exception:
+            held = False
+        if not held:
+            self._lost.set()
+        return held
+
+    def release(self) -> None:
+        """输入：无；使用本租约创建时的随机所有者令牌。
+
+        输出：无；停止续租，并且仅在 Redis 令牌匹配时删除锁键。
+        功能：保证已过期或被替换的旧回合无法误删后来回合持有的租约。
+        """
+
+        self._stop_renewal.set()
+        if not self._acquired or self._released:
+            return
+        self._released = True
+        try:
+            self._redis.eval(_RELEASE_TURN_LEASE, 1, self._key, self._token)
+        except Exception:
+            logger.warning("释放会话回合租约失败", exc_info=True)
+
+    def _start_renewal(self) -> None:
+        """输入：无；要求租约已通过 ``acquire`` 成功获得。
+
+        输出：无；原地启动守护续租线程。
+        功能：让长时间的 LLM、工具或多 Agent 编排持续保有同一令牌租约，同时保留 Redis TTL 的故障恢复边界。
+        """
+
+        renewal_thread = threading.Thread(
+            target=self._renew_forever,
+            name="suning-im-turn-lease",
+            daemon=True,
+        )
+        renewal_thread.start()
+
+    def _renew_forever(self) -> None:
+        """输入：无；依赖本对象的停止事件、Redis 键和所有者令牌。
+
+        输出：无；续租失败时标记租约丢失并结束守护线程。
+        功能：以比较令牌的 Lua 脚本刷新 TTL，避免网络抖动后的旧线程续写不属于自己的锁。
+        """
+
+        while not self._stop_renewal.wait(TURN_LEASE_RENEW_SECONDS):
+            try:
+                renewed = bool(
+                    self._redis.eval(
+                        _RENEW_TURN_LEASE,
+                        1,
+                        self._key,
+                        self._token,
+                        str(TURN_LEASE_TTL_SECONDS),
+                    )
+                )
+            except Exception:
+                renewed = False
+            if not renewed:
+                self._lost.set()
+                logger.warning("会话回合租约续租失败，已停止写入上下文")
+                return
 
 
 def _text(value: Any) -> str:
@@ -70,6 +215,21 @@ def _api_usage(usage: Any) -> tuple[int, int]:
     return (
         _token_count(usage.get("prompt_tokens", usage.get("input_tokens"))),
         _token_count(usage.get("completion_tokens", usage.get("output_tokens"))),
+    )
+
+
+def _api_prompt_cache_usage(usage: Any) -> tuple[int, int]:
+    """输入：Hermes ``post_api_request`` 的 ``usage`` 映射或其他值。
+
+    输出：缓存命中与未命中的输入 Token 数；字段缺失或无效时均返回 ``0``。
+    功能：提取 DeepSeek 自动上下文缓存的原生用量字段，供观测层验证 Prompt 前缀复用效果。
+    """
+
+    if not isinstance(usage, dict):
+        return 0, 0
+    return (
+        _token_count(usage.get("prompt_cache_hit_tokens")),
+        _token_count(usage.get("prompt_cache_miss_tokens")),
     )
 
 
@@ -142,6 +302,15 @@ class IdentitySessionRouter:
             platform=resolved_platform,
             chat_type=resolved_chat_type,
         )
+
+    def new_turn_lease(self, session_id: str) -> ConversationTurnLease:
+        """输入：已由身份路由生成的逻辑会话 ID ``session_id``。
+
+        输出：尚未获取的 Redis 回合租约对象。
+        功能：让统一身份 Hook 用与活跃会话相同的 Redis 连接对同一私聊或群聊逻辑会话执行跨进程串行化。
+        """
+
+        return ConversationTurnLease(self._redis, session_id)
 
     def _resolve_hermes_user_id(self, platform: str, external_subject: str) -> str:
         """输入：已校验平台 ``platform`` 与可信平台用户 ID ``external_subject``。
@@ -220,11 +389,12 @@ class UnifiedIdentityHooks:
         knowledge_hooks: Any = None,
         skill_hooks: Any = None,
         observability_client: Any = None,
+        tool_governor: Any = None,
     ) -> None:
         """输入：身份路由器、短期会话 Hooks、可选扩展 Hooks 和观测客户端。
 
         输出：保存同一请求中共用的 Hook 依赖和 ContextVar 路由状态。
-        功能：在一个可信身份解析结果下依次运行既有能力，并可选记录 Agent 回合观测数据。
+        功能：在一个可信身份解析结果下依次运行既有能力，并可选注入工具治理和记录 Agent 回合观测数据。
         """
 
         self._router = router
@@ -233,6 +403,7 @@ class UnifiedIdentityHooks:
         self._knowledge_hooks = knowledge_hooks
         self._skill_hooks = skill_hooks
         self._observability = observability_client
+        self._tool_governor = tool_governor
         self._route: ContextVar[SessionRoute | None] = ContextVar(
             "suning_identity_session_route",
             default=None,
@@ -240,6 +411,18 @@ class UnifiedIdentityHooks:
         self._denied: ContextVar[bool] = ContextVar(
             "suning_identity_session_denied",
             default=False,
+        )
+        self._busy: ContextVar[bool] = ContextVar(
+            "suning_identity_session_busy",
+            default=False,
+        )
+        self._lease_lost: ContextVar[bool] = ContextVar(
+            "suning_identity_session_lease_lost",
+            default=False,
+        )
+        self._turn_lease: ContextVar[ConversationTurnLease | None] = ContextVar(
+            "suning_identity_session_turn_lease",
+            default=None,
         )
         self._trace: ContextVar[Any] = ContextVar(
             "suning_identity_session_trace",
@@ -280,10 +463,19 @@ class UnifiedIdentityHooks:
         except IdentityResolutionError:
             self._route.set(None)
             self._denied.set(True)
+            self._busy.set(False)
             return {"context": "身份校验失败。不得调用工具或提供业务数据，只能回复用户未授权。"}
 
         self._route.set(route)
         self._denied.set(False)
+        self._busy.set(False)
+        self._lease_lost.set(False)
+        turn_lease = self._router.new_turn_lease(route.session_id)
+        if not turn_lease.acquire(wait_seconds=TURN_LEASE_WAIT_SECONDS):
+            self._turn_lease.set(None)
+            self._busy.set(True)
+            return {"context": "同一账号已有跨平台会话正在处理。不得调用工具，只能提示用户稍后重试。"}
+        self._turn_lease.set(turn_lease)
         if self._observability is not None:
             trace_record, _ = self._observability.ensure_trace(
                 conversation_id=route.session_id,
@@ -306,27 +498,60 @@ class UnifiedIdentityHooks:
             contexts.append(self._context_text(self._knowledge_hooks.pre_llm_call(**routed_kwargs)))
         if self._skill_hooks is not None:
             contexts.append(self._context_text(self._skill_hooks.pre_llm_call(**routed_kwargs)))
+        if self._tool_governor is not None:
+            scene = self._scene(route.session_id)
+            whitelist = self._tool_governor.begin_turn(
+                session_id=route.session_id,
+                turn_id=_text(kwargs.get("turn_id")) or secrets.token_urlsafe(12),
+                scene=scene,
+            )
+            contexts.append(self._tool_governor.build_tool_prompt(whitelist))
         combined = "\n\n".join(context for context in contexts if context)
         return {"context": combined} if combined else None
+
+    def _scene(self, session_id: str) -> str:
+        """输入：统一身份层生成的逻辑会话 ID ``session_id``。
+
+        输出：当前已确认的槽位话题；读取失败或无话题时返回 ``general``。
+        功能：复用 ConversationHooks 已持久化的意图结果，为工具白名单选择场景而不新增路由模型。
+        """
+
+        try:
+            context = self._conversation_hooks.manager.load_context(session_id)
+            return _text(context.slots.topic) or "general"
+        except Exception:
+            return "general"
 
     def transform_llm_output(self, *, response_text: str = "", **_kwargs: Any) -> str | None:
         """输入：模型最终文本 ``response_text`` 与其余 Hermes 输出生命周期字段。
 
-        输出：身份拒绝时返回固定拒绝文案；正常会话返回 ``None`` 保留原回答。
-        功能：在所有工具调用完成后强制覆盖未绑定或已停用用户的输出，确保身份校验默认拒绝。
+        输出：身份拒绝、并发超时或租约失效时返回固定文案；正常会话返回 ``None`` 保留原回答。
+        功能：在所有工具调用完成后覆盖不可安全执行的回合输出，确保身份校验和跨平台并发控制均默认拒绝。
         """
 
         del response_text
-        return UNAUTHORIZED_REPLY if self._denied.get() else None
+        if self._denied.get():
+            return UNAUTHORIZED_REPLY
+        if self._busy.get():
+            return CONCURRENT_TURN_REPLY
+        if self._lease_lost.get():
+            return LEASE_LOST_REPLY
+        return None
 
     def pre_tool_call(self, *, tool_name: str = "", **kwargs: Any) -> dict[str, str] | None:
         """输入：模型即将调用的工具名 ``tool_name`` 与其余 Hermes 工具生命周期字段。
 
-        输出：身份拒绝时返回 Hermes ``block`` 指令；正常会话返回 ``None`` 继续执行。
-        功能：在未绑定或停用用户的工具产生查询、编排或消息发送副作用前实施默认拒绝，并记录已授权调用的 Skill 轨迹。
+        输出：身份拒绝、并发超时或租约失效时返回 Hermes ``block`` 指令；正常会话返回 ``None`` 继续执行。
+        功能：在未绑定、并发未获租约或失去所有权时阻断工具副作用，并只为唯一租约所有者记录 Skill 轨迹。
         """
 
-        if not self._denied.get():
+        if self._denied.get():
+            message = UNAUTHORIZED_REPLY
+        elif self._busy.get():
+            message = CONCURRENT_TURN_REPLY
+        elif not self._has_turn_lease():
+            message = LEASE_LOST_REPLY
+        else:
             route = self._route.get()
             if route is not None and self._skill_hooks is not None:
                 routed_kwargs = {
@@ -340,7 +565,7 @@ class UnifiedIdentityHooks:
             return None
         return {
             "action": "block",
-            "message": f"工具 {tool_name or '调用'} 已被阻止：{UNAUTHORIZED_REPLY}",
+            "message": f"工具 {tool_name or '调用'} 已被阻止：{message}",
         }
 
     def pre_api_request(self, *, api_request_id: str = "", **kwargs: Any) -> None:
@@ -350,7 +575,7 @@ class UnifiedIdentityHooks:
         功能：在真实模型网络请求开始处创建 Span，使 MCP 调用时间不再混入 LLM 耗时。
         """
 
-        if self._observability is None or self._trace.get() is None:
+        if not self._has_turn_lease() or self._observability is None or self._trace.get() is None:
             return
         key = api_request_id or str(kwargs.get("api_call_count") or "default")
         spans = dict(self._api_spans.get())
@@ -371,10 +596,15 @@ class UnifiedIdentityHooks:
         if span is None or self._observability is None:
             return
         prompt_tokens, completion_tokens = _api_usage(kwargs.get("usage"))
+        prompt_cache_hit_tokens, prompt_cache_miss_tokens = _api_prompt_cache_usage(
+            kwargs.get("usage")
+        )
         self._observability.end_llm_span(
             span,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens=prompt_cache_miss_tokens,
             model=_text(kwargs.get("response_model") or kwargs.get("model")),
             duration_ms=_api_duration_ms(kwargs.get("api_duration")),
         )
@@ -407,14 +637,16 @@ class UnifiedIdentityHooks:
     ) -> None:
         """输入：Hermes 原始会话、可能为空的发送者和完整回答后生命周期参数 ``kwargs``。
 
-        输出：无；正常请求写入短期上下文并提交长期记忆，拒绝请求不产生用户数据副作用。
-        功能：复用回答前保存的逻辑会话路由，兼容 Hermes post Hook 缺少发送者的运行时契约。
+        输出：无；唯一租约所有者写入短期上下文并提交长期记忆，其他请求不产生用户数据副作用。
+        功能：复用回答前保存的逻辑会话路由，在释放回合租约前完成持久化，避免跨 IM 并发回合覆盖上下文。
         """
 
         del session_id, sender_id
         route = self._route.get()
         try:
-            if route is None or self._denied.get():
+            if route is None or self._denied.get() or self._busy.get():
+                return
+            if not self._has_turn_lease():
                 return
             routed_kwargs = {
                 **kwargs,
@@ -437,13 +669,66 @@ class UnifiedIdentityHooks:
             self._trace.set(None)
             self._route.set(None)
             self._denied.set(False)
+            self._busy.set(False)
+            self._lease_lost.set(False)
+            self._release_turn_lease()
+
+    def on_session_end(self, **kwargs: Any) -> None:
+        """输入：Hermes 回合结束状态及可选最终回复字段 ``kwargs``。
+
+        输出：无；在失败、中断或正常完成后停止续租并清理本请求状态。
+        功能：覆盖 ``post_llm_call`` 不会触发的异常和中断路径，确保崩溃外的所有回合及时释放统一会话租约。
+        """
+
+        trace_record = self._trace.get()
+        if trace_record is not None and self._observability is not None:
+            self._observability.finish_trace(
+                trace_record,
+                _text(kwargs.get("response_text") or kwargs.get("assistant_response")),
+            )
+        self._api_spans.set({})
+        self._trace.set(None)
+        self._route.set(None)
+        self._denied.set(False)
+        self._busy.set(False)
+        self._lease_lost.set(False)
+        self._release_turn_lease()
+
+    def _has_turn_lease(self) -> bool:
+        """输入：无；读取当前异步请求的 ContextVar 租约。
+
+        输出：当前请求仍是逻辑会话唯一 Redis 租约所有者时返回 ``True``，否则返回 ``False``。
+        功能：集中标记失去租约的回合，使其无法继续调用工具或将旧的读改写结果保存到共享上下文。
+        """
+
+        turn_lease = self._turn_lease.get()
+        if turn_lease is None or not turn_lease.is_held():
+            if turn_lease is not None:
+                self._lease_lost.set(True)
+            return False
+        return True
+
+    def _release_turn_lease(self) -> None:
+        """输入：无；读取当前异步请求的 ContextVar 租约。
+
+        输出：无；原地停止续租、条件释放 Redis 键并清空该请求的租约引用。
+        功能：让正常 post Hook 和兜底 session-end Hook 以相同的令牌安全、幂等地结束会话排他权。
+        """
+
+        turn_lease = self._turn_lease.get()
+        self._turn_lease.set(None)
+        if turn_lease is not None:
+            turn_lease.release()
 
 
 __all__ = [
     "ACTIVE_SESSION_TTL_SECONDS",
+    "CONCURRENT_TURN_REPLY",
+    "ConversationTurnLease",
     "IdentityResolutionError",
     "IdentitySessionRouter",
     "SessionRoute",
+    "LEASE_LOST_REPLY",
     "UNAUTHORIZED_REPLY",
     "UnifiedIdentityHooks",
 ]

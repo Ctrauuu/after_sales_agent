@@ -1,380 +1,90 @@
-# 05m-MCP调用失败重试与降级
+# 05m · MCP 调用失败的重试与降级策略
 
-# 05m · MCP 调用失败的重试与降级策略
-
-> 这个难点的本质是：Agent 调用 MCP 工具拿数据时，被调的服务可能超时、连接被拒、返回空数据、甚至返回格式错误的脏数据。Agent 不能因为一个 MCP 调用失败就整个任务崩溃——必须优雅降级，告诉用户"这部分数据暂时不可用，其他分析已完成"。
-
----
+> Agent 调用 MCP Tool 时可能遇到超时、连接失败、权限拒绝、远端工具错误、空结果或响应格式错误。
+> 本实现把重试、熔断和降级集中在 Hermes 插件的 MCP 调用边界，避免单个依赖故障中断整个分析。
 
 ## 为什么难
 
-1.  **故障类型多**：超时、连接拒绝、权限不足、返回空、返回错误格式——每种故障需要不同的处理策略
-    
-2.  **部分失败 vs 全部失败**：5 个 MCP 调用中 1 个失败——是重试还是跳过？如果是有依赖关系的调用，前置失败导致后续也无法执行，怎么处理？
-    
-3.  **重试不是万能的**：幂等的查询（查订单列表）可以重试，但非幂等的操作（虽然本项目都是只读，但如果未来扩展）不能盲目重试
-    
-4.  **降级结果的可信标注**：回复用户时必须明确标记哪些数据正常、哪些降级了、哪些缺失——不能让用户以为降级结果是完整数据
-    
+1. 不同故障的处理不同：只有超时且 Tool 明确允许时才能重试，权限、远端业务错误和格式错误不能盲目重试。
+2. 熔断状态需要在多个 Hermes 进程间共享，半开探测还必须跨进程互斥。
+3. 每次重试都必须重新签发 attestation/JTI，否则 MCP Server 的防重放校验会拒绝请求。
+4. “查询成功但为空”与“服务失败导致不可用”必须保持不同语义，并在子 Agent 聚合后继续可见。
 
----
+## 实际调用链
 
-## 技术方案
-
-采用 **熔断器（Circuit Breaker）+ 指数退避重试 + 多级降级策略** 三位一体：
-
-```mermaid
-flowchart TD
-    A[MCP 调用请求] --> B{熔断器状态?}
-    B -->|OPEN 断路器打开| C[直接失败<br/>不发起真实请求<br/>记录: circuit_open]
-    B -->|HALF_OPEN| D[尝试一次探测请求]
-    B -->|CLOSED| E[发起真实 MCP 调用]
-
-    D -->|成功| F[熔断器恢复 → CLOSED]
-    D -->|失败| G[熔断器保持 OPEN]
-
-    E -->|成功| H[返回数据<br/>记录: success]
-    E -->|超时/timeout| I[指数退避重试<br/>1s → 2s → 4s → 放弃]
-    E -->|连接拒绝| J[不重试<br/>直接失败]
-    E -->|返回空数据| K{是查询类工具?}
-    K -->|是| L[返回空数组 + 标记: empty]
-    K -->|否| M[记录: unexpected_empty]
-
-    I -->|重试成功| H
-    I -->|全部重试失败| N[记录: timeout_retry_exhausted]
-    J --> N
-    M --> N
-
-    N --> O[触发降级策略<br/>按降级等级处理]
-    O --> P{降级等级}
-    P -->|L1: 非核心数据| Q[跳过: 不阻断主流程<br/>标记缺失项继续]
-    P -->|L2: 核心数据| R[返回部分结果<br/>标注: '该部分数据暂不可用'<br/>建议用户稍后重试]
-    P -->|L3: 关键数据| S[整个请求失败<br/>提示: '系统繁忙请稍后重试']
-    Q --> T[聚合所有结果回复用户]
-    R --> T
+```text
+plugin register
+  → 复用 Redis Client
+  → 创建并复用 MCPCallManager
+  → make_handler(manager)
+  → invoke_business_tool(...)
+  → MCPCallManager.call(tool_spec, attempt)
+  → circuit 检查
+  → attempt 内重新获取身份、签发 attestation 并调用 ClientSession.call_tool
+  → MCPCallResult
+  → Hermes tool_result / tool_error
 ```
----
 
-## 实现思路
+`MCPCallManager` 不感知 Hermes Tool Registry、用户身份或 attestation schema；这些职责仍由
+`bridge.py` 承担。MCP Server 的 `@mcp.tool` 业务实现不包含 retry、circuit breaker 或 degrade。
 
-分别为每个 MCP Server 维护一个熔断器实例（在 Redis 中共享状态），记录连续失败次数。超过阈值（5 次/60 秒）触发熔断，之后 30 秒内不发送真实请求直接失败。半开状态时发送一次探测请求决定是否恢复。重试策略针对超时类错误（幂等查询），指数退避 3 次后放弃。降级等级由每个 MCP Tool 预声明——查询退单统计是 L2 核心数据，查询物流轨迹是 L1 非核心。
+## 重试和故障分类
 
----
+- 单次调用超时为 10 秒。
+- 只有 `FailureType.TIMEOUT` 且 `ToolSpec.retry_on_timeout=true` 时重试。
+- 最多额外重试 3 次，退避为 1 秒、2 秒、4 秒，并附加 0～200ms jitter。
+- 每个真实 attempt 都重新签发 attestation，因此不会复用 JTI。
+- `CONNECTION_REFUSED`、`PERMISSION_DENIED`、`REMOTE_TOOL_ERROR`、
+  `MALFORMED_RESPONSE`、`EMPTY_RESULT` 和 `UNKNOWN` 不重试。
+- `asyncio.CancelledError` 始终继续向上抛出。
 
-## 关键代码示例
+合法空结果由 `ToolSpec.empty_result_is_success` 声明。成功返回的
+`trace_order_timeline.partial=true` 及其 `source_failures` 属于时间线内部的部分结果，不会被顶层
+Manager 认定为 MCP Server 失败。
 
-```python
-# circuit_breaker.py - 熔断器 + 重试 + 降级
+## Redis 熔断状态
 
-import asyncio
-import time
-import random
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional, Callable, Any
-import json
+熔断粒度是稳定的逻辑 `server_id`，不按 Tool、用户或 endpoint URL 拆分。
 
-class CircuitState(Enum):
-    CLOSED = "closed"         # 正常
-    OPEN = "open"             # 熔断
-    HALF_OPEN = "half_open"   # 半开（探测中）
+- 60 秒窗口内累计 5 次可计数失败后进入 `OPEN`。
+- `OPEN` 冷却 30 秒，状态 TTL 为 120 秒。
+- 冷却后通过 15 秒的 Redis `SET NX` lease 只允许一个跨进程 `HALF_OPEN` probe。
+- probe 成功回到 `CLOSED`；失败重新 `OPEN` 30 秒；probe 本身不重试。
+- 仅 `TIMEOUT`、`CONNECTION_REFUSED`、`MALFORMED_RESPONSE` 计入熔断。
+- Redis 操作通过 `asyncio.to_thread()` 执行；Redis 故障时 fail-open，且不计为 MCP Server 故障。
 
-class DegradeLevel(Enum):
-    L1_NON_CRITICAL = 1      # 非核心，跳过不阻断
-    L2_CORE = 2              # 核心，缺了标注出来
-    L3_CRITICAL = 3          # 关键，缺了整体失败
+## Tool 策略与降级
 
-class FailureType(Enum):
-    TIMEOUT = "timeout"               # 超时（可重试）
-    CONNECTION_REFUSED = "conn_refused"  # 连接拒绝（不重试）
-    PERMISSION_DENIED = "perm_denied"    # 权限不足（不重试）
-    EMPTY_RESULT = "empty"               # 空结果（不一定算失败）
-    MALFORMED_RESPONSE = "malformed"     # 脏数据（不重试）
+每个 MCP Tool 的 `server_id`、`degrade_level`、`retry_on_timeout` 和空结果语义只在
+`schemas.py` 的 `TOOL_SPECS` 中声明，不在 bridge 或 Manager 中按工具名重复映射。
 
-@dataclass
-class CircuitBreaker:
-    """单个 MCP Server 的熔断器"""
-    server_id: str
-    failure_threshold: int = 5          # 连续失败阈值
-    timeout_window: int = 60            # 统计窗口（秒）
-    recovery_timeout: int = 30          # 熔断恢复时间（秒）
-    state: CircuitState = CircuitState.CLOSED
-    failure_count: int = 0
-    last_failure_time: float = 0
-    last_success_time: float = 0
-    half_open_probe_sent: bool = False
+- L1（非核心）：返回结构化 `tool_result`，`available=false`，其他分析继续。
+- L2（核心）：同样返回 `tool_result`，并明确提示对应维度暂不可用、当前结果不完整；子 Agent
+  保持成功状态，摘要和最终聚合报告保留 notice。
+- L3（关键）：返回安全的 `tool_error`。当前没有实际配置为 L3 的 Tool。
 
-    def before_call(self) -> bool:
-        """调用前检查：是否允许发起请求"""
-        now = time.time()
+Agent 输出只包含安全 notice，不泄露内部异常、attestation、JTI、SQL、credential 或 stack trace。
 
-        if self.state == CircuitState.CLOSED:
-            # 清理过期的失败计数
-            if now - self.last_failure_time > self.timeout_window:
-                self.failure_count = 0
-            return True
+## 可观测性
 
-        if self.state == CircuitState.OPEN:
-            # 检查熔断恢复时间是否已到
-            if now - self.last_failure_time > self.recovery_timeout:
-                self.state = CircuitState.HALF_OPEN
-                self.half_open_probe_sent = False
-                # 继续 fall through 到 HALF_OPEN 处理
-            else:
-                return False
+现有 MCP Span 会记录 `retry_count`、`failure_type`、`circuit_state`、`degrade_level`、最终
+`success` 和 `degraded`。实现复用项目原有 telemetry client，没有新增观测后端。
 
-        if self.state == CircuitState.HALF_OPEN:
-            # 只允许一次探测请求
-            if not self.half_open_probe_sent:
-                self.half_open_probe_sent = True
-                return True
-            return False
+## 实现位置
 
-        return True
+- `.hermes/plugins/suning-rbac-bridge/mcp_resilience.py`：基础类型、调用管理器及 Redis 熔断状态。
+- `.hermes/plugins/suning-rbac-bridge/schemas.py`：MCP Tool 策略声明。
+- `.hermes/plugins/suning-rbac-bridge/__init__.py`：Redis Client 和 Manager 的注册期生命周期。
+- `.hermes/plugins/suning-rbac-bridge/bridge.py`：真实 MCP attempt、结果校验及 Hermes 返回转换。
+- `.hermes/plugins/suning-rbac-bridge/orchestration.py`：子 Agent 摘要和聚合报告的降级语义。
+- `.hermes/plugins/suning-rbac-bridge/observability.py`：resilience Span 属性。
+- `backend/tests/test_mcp_resilience.py`、`test_mcp_rbac_wiring.py`、
+  `test_complex_analysis_orchestration.py`、`test_observability.py`：T01～T22 及相关回归覆盖。
 
-    def on_success(self):
-        """调用成功后重置"""
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.last_success_time = time.time()
-
-    def on_failure(self):
-        """调用失败后累加计数"""
-        now = time.time()
-        self.failure_count += 1
-        self.last_failure_time = now
-
-        if self.state == CircuitState.HALF_OPEN:
-            # 半开状态也失败了，重新打开熔断器
-            self.state = CircuitState.OPEN
-        elif self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-
-    def to_dict(self) -> dict:
-        return {
-            "server_id": self.server_id,
-            "state": self.state.value,
-            "failure_count": self.failure_count,
-            "last_failure_time": self.last_failure_time,
-        }
-
-
-@dataclass
-class MCPCallResult:
-    """MCP 调用结果"""
-    server_id: str
-    tool_name: str
-    success: bool
-    data: Any = None
-    error_type: Optional[FailureType] = None
-    error_message: str = ""
-    retry_count: int = 0
-    total_latency_ms: float = 0
-    degraded: bool = False
-    degrade_note: str = ""
-
-
-class MCPCallManager:
-    """MCP 调用管理器：熔断 + 重试 + 降级"""
-
-    MAX_RETRIES = 3
-    BASE_BACKOFF_MS = 1000     # 初始退避 1 秒
-
-    # 各 MCP Tool 的降级等级
-    TOOL_DEGRADE_LEVELS = {
-        "search_orders": DegradeLevel.L2_CORE,
-        "get_order_detail": DegradeLevel.L2_CORE,
-        "query_return_stats_nl2sql": DegradeLevel.L2_CORE,
-        "get_aftersale_workflow": DegradeLevel.L1_NON_CRITICAL,
-        "get_product_info": DegradeLevel.L1_NON_CRITICAL,
-        "query_logistics": DegradeLevel.L1_NON_CRITICAL,
-        "get_refund_status": DegradeLevel.L2_CORE,
-    }
-
-    def __init__(self, redis_client):
-        self.redis = redis_client
-        self._breakers: dict[str, CircuitBreaker] = {}
-
-    def get_breaker(self, server_id: str) -> CircuitBreaker:
-        """获取或创建熔断器实例（Redis 共享状态）"""
-        if server_id not in self._breakers:
-            # 尝试从 Redis 恢复
-            cached = self.redis.get(f"cb:{server_id}")
-            if cached:
-                data = json.loads(cached)
-                self._breakers[server_id] = CircuitBreaker(**data)
-            else:
-                self._breakers[server_id] = CircuitBreaker(server_id=server_id)
-        return self._breakers[server_id]
-
-    def _persist_breaker(self, breaker: CircuitBreaker):
-        """熔断器状态持久化到 Redis"""
-        self.redis.setex(
-            f"cb:{breaker.server_id}",
-            120,  # TTL 2分钟
-            json.dumps(breaker.to_dict()),
-        )
-
-    async def call(
-        self, server_id: str, tool_name: str, fn: Callable, *args, **kwargs
-    ) -> MCPCallResult:
-        """
-        带熔断+重试+降级的 MCP 调用入口。
-        fn: 实际的 MCP 调用函数
-        """
-
-        breaker = self.get_breaker(server_id)
-        t_start = time.time()
-
-        # 1. 熔断检查
-        if not breaker.before_call():
-            degrade_level = self.TOOL_DEGRADE_LEVELS.get(
-                tool_name, DegradeLevel.L1_NON_CRITICAL
-            )
-            return MCPCallResult(
-                server_id=server_id,
-                tool_name=tool_name,
-                success=False,
-                error_type=FailureType.CONNECTION_REFUSED,
-                error_message=f"服务 {server_id} 已熔断",
-                total_latency_ms=0,
-                degraded=True,
-                degrade_note=f"熔断等级: {degrade_level.name}",
-            )
-
-        # 2. 指数退避重试
-        last_error = None
-        for retry in range(self.MAX_RETRIES + 1):  # 0 = 首次尝试
-            try:
-                result = await asyncio.wait_for(
-                    fn(*args, **kwargs),
-                    timeout=10,  # 单次调用超时 10 秒
-                )
-
-                # 检查空结果
-                if result is None or (isinstance(result, list) and len(result) == 0):
-                    degrade_level = self.TOOL_DEGRADE_LEVELS.get(
-                        tool_name, DegradeLevel.L1_NON_CRITICAL
-                    )
-                    breaker.on_success()  # 空结果不算失败
-                    self._persist_breaker(breaker)
-                    return MCPCallResult(
-                        server_id=server_id,
-                        tool_name=tool_name,
-                        success=True,
-
-                        data=[ ],
-
-                        retry_count=retry,
-                        total_latency_ms=(time.time() - t_start) * 1000,
-                        degraded=(degrade_level == DegradeLevel.L2_CORE),
-                        degrade_note="查询结果为空",
-                    )
-
-                # 成功
-                breaker.on_success()
-                self._persist_breaker(breaker)
-                return MCPCallResult(
-                    server_id=server_id,
-                    tool_name=tool_name,
-                    success=True,
-                    data=result,
-                    retry_count=retry,
-                    total_latency_ms=(time.time() - t_start) * 1000,
-                )
-
-            except asyncio.TimeoutError:
-                last_error = (FailureType.TIMEOUT, f"{tool_name} 超时 (尝试 {retry+1}/{self.MAX_RETRIES+1})")
-                if retry < self.MAX_RETRIES:
-                    # 指数退避 + 随机抖动
-                    backoff = self.BASE_BACKOFF_MS * (2 ** retry) + random.uniform(0, 200)
-                    await asyncio.sleep(backoff / 1000)
-                continue
-
-            except ConnectionRefusedError:
-                last_error = (FailureType.CONNECTION_REFUSED, f"{server_id} 连接被拒绝")
-                break  # 不重试
-
-            except Exception as e:
-                last_error = (FailureType.MALFORMED_RESPONSE, str(e))
-                break  # 不重试
-
-        # 3. 全部重试失败 → 记录失败并触发降级
-        breaker.on_failure()
-        self._persist_breaker(breaker)
-
-        error_type, error_msg = last_error or (
-            FailureType.MALFORMED_RESPONSE, "未知错误"
-        )
-        degrade_level = self.TOOL_DEGRADE_LEVELS.get(
-            tool_name, DegradeLevel.L1_NON_CRITICAL
-        )
-
-        return MCPCallResult(
-            server_id=server_id,
-            tool_name=tool_name,
-            success=False,
-            error_type=error_type,
-            error_message=error_msg,
-            retry_count=self.MAX_RETRIES,
-            total_latency_ms=(time.time() - t_start) * 1000,
-            degraded=True,
-            degrade_note=f"熔断等级: {degrade_level.name}",
-        )
-
-
-# ===== 使用示例 =====
-
-call_manager = MCPCallManager(redis_client)
-
-async def execute_agent_query(query: str):
-    """Agent 调用多个 MCP 工具，熔断+降级"""
-
-    # 并行调用 3 个 MCP 工具
-    results: list[MCPCallResult] = await asyncio.gather(
-        call_manager.call("mcp-order", "search_orders",
-                          order_client.search_orders, status="returned"),
-        call_manager.call("mcp-aftersale", "query_return_stats_nl2sql",
-                          aftersale_client.query_return_stats_nl2sql, group_by="category"),
-        call_manager.call("mcp-logistics", "query_logistics",
-                          logistics_client.query_logistics, return_id=12345),
-    )
-
-    # 按降级等级处理结果
-    critical_failed = [
-        r for r in results
-        if not r.success and self.TOOL_DEGRADE_LEVELS.get(r.tool_name) == DegradeLevel.L3_CRITICAL
-    ]
-    core_degraded = [
-        r for r in results
-        if r.degraded and self.TOOL_DEGRADE_LEVELS.get(r.tool_name) == DegradeLevel.L2_CORE
-    ]
-    non_critical_missing = [
-        r for r in results
-        if r.degraded and self.TOOL_DEGRADE_LEVELS.get(r.tool_name) == DegradeLevel.L1_NON_CRITICAL
-    ]
-
-    # 构建降级提示
-
-    degrade_notes = [ ]
-
-    if critical_failed:
-        return {"error": "核心数据查询失败，请稍后重试", "details": [r.error_message for r in critical_failed]}
-    if core_degraded:
-        degrade_notes.append(f"以下数据暂不可用: {', '.join(r.tool_name for r in core_degraded)}")
-    if non_critical_missing:
-        degrade_notes.append(f"以下辅助数据未获取: {', '.join(r.tool_name for r in non_critical_missing)}")
-
-    response = _build_response(results)
-    if degrade_notes:
-        response["notice"] = "; ".join(degrade_notes)
-
-    return response
-```
----
+本实现复用已有 `REDIS_URL` 和 MCP endpoint 配置，没有新增环境变量或第三方依赖。
 
 ## 涉及业务模块
 
-*   M3 · MCP 数据网关
-    
-*   M8 · 定时报告推送（推送时若某服务熔断，降级处理同样适用）
+- M3 · MCP 数据网关
+- 复杂售后分析及其子 Agent 聚合链路
+- M8 · 定时报告推送（调用同一桥接边界时沿用相同降级语义）

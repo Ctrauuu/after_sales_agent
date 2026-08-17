@@ -49,7 +49,7 @@ Tool。这样可以避免 Agent 在多个能力重叠的工具之间误选。
 
 ### 第一步：两个动态 MCP 入口
 
-先看 [`aftersale_server.py`](../mcp_suning/aftersale_server.py)：
+先看 [`servers/aftersale.py`](../mcp_suning/servers/aftersale.py)：
 
 1. `query_return_stats_nl2sql`
 2. `query_aftersale_nl2sql`
@@ -123,7 +123,7 @@ Schema 和规则进入 System Message，分析问题进入 User Message。API Ke
 
 ### 第八步：权限与测试
 
-权限来源看 [`auth_middleware.py`](../mcp_suning/auth_middleware.py) 的：
+权限来源看 [`security/rbac.py`](../mcp_suning/security/rbac.py) 的：
 
 1. `authorize_mcp_request`
 2. `PermissionInterceptor.intercept`

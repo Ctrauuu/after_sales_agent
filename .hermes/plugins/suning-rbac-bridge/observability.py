@@ -54,6 +54,8 @@ class AgentTrace:
     start_time: float = field(default_factory=time.perf_counter)
     spans: list[TraceSpan] = field(default_factory=list)
     total_llm_tokens: int = 0
+    total_prompt_cache_hit_tokens: int = 0
+    total_prompt_cache_miss_tokens: int = 0
     total_mcp_calls: int = 0
     total_mcp_failures: int = 0
     root_span: Any = field(default=None, repr=False)
@@ -215,14 +217,16 @@ class AgentObservability:
         *,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        prompt_cache_hit_tokens: int = 0,
+        prompt_cache_miss_tokens: int = 0,
         model: str = "",
         duration_ms: float | None = None,
         error: str = "",
     ) -> None:
         """输入：LLM Span、输入/输出 Token、模型名、可选 API 耗时与错误文本。
 
-        输出：无；结束 Span 并写入模型、Token、耗时和可选失败属性。
-        功能：把 Hermes 单次 API 调用的真实用量归档到 Trace；缺少用量时保持零值而不猜测 Token。
+        输出：无；结束 Span 并写入模型、普通及缓存 Token、耗时和可选失败属性。
+        功能：把 Hermes 单次 API 调用的真实用量归档到 Trace，区分 DeepSeek 上下文缓存命中与未命中 Token。
         """
 
         self._end_span(
@@ -232,6 +236,8 @@ class AgentObservability:
                 "prompt_tokens": max(prompt_tokens, 0),
                 "completion_tokens": max(completion_tokens, 0),
                 "total_tokens": max(prompt_tokens, 0) + max(completion_tokens, 0),
+                "prompt_cache_hit_tokens": max(prompt_cache_hit_tokens, 0),
+                "prompt_cache_miss_tokens": max(prompt_cache_miss_tokens, 0),
                 "error_message": error,
             },
             duration_ms=duration_ms,
@@ -267,11 +273,16 @@ class AgentObservability:
         rows_returned: int,
         success: bool,
         error: str = "",
+        retry_count: int = 0,
+        failure_type: str = "",
+        circuit_state: str = "",
+        degrade_level: str = "",
+        degraded: bool = False,
     ) -> None:
-        """输入：MCP Span、返回行数、调用成功状态和可选错误文本。
+        """输入：MCP Span、结果统计、resilience 状态和可选错误文本。
 
-        输出：无；结束 Span 并写入成功、行数和错误属性。
-        功能：显式标记被部分失败降级的 MCP，避免慢调用或失败在 Agent 回答中被静默忽略。
+        输出：无；结束 Span 并写入成功、降级、重试和熔断属性。
+        功能：在单个逻辑 MCP Span 上记录 resilience 决策，不按 retry attempt 扩大调用数。
         """
 
         self._end_span(
@@ -279,6 +290,11 @@ class AgentObservability:
             {
                 "rows_returned": max(rows_returned, 0),
                 "success": success,
+                "degraded": degraded,
+                "retry_count": max(retry_count, 0),
+                "failure_type": failure_type,
+                "circuit_state": circuit_state,
+                "degrade_level": degrade_level,
                 "error_message": error,
             },
             failed=not success,
@@ -293,6 +309,16 @@ class AgentObservability:
 
         agent_trace.total_llm_tokens = sum(
             int(span.attributes.get("total_tokens", 0))
+            for span in agent_trace.spans
+            if span.name.startswith("llm.")
+        )
+        agent_trace.total_prompt_cache_hit_tokens = sum(
+            int(span.attributes.get("prompt_cache_hit_tokens", 0))
+            for span in agent_trace.spans
+            if span.name.startswith("llm.")
+        )
+        agent_trace.total_prompt_cache_miss_tokens = sum(
+            int(span.attributes.get("prompt_cache_miss_tokens", 0))
             for span in agent_trace.spans
             if span.name.startswith("llm.")
         )
@@ -311,6 +337,8 @@ class AgentObservability:
             "platform": agent_trace.platform,
             "duration_ms": round(duration_ms, 3),
             "total_llm_tokens": agent_trace.total_llm_tokens,
+            "total_prompt_cache_hit_tokens": agent_trace.total_prompt_cache_hit_tokens,
+            "total_prompt_cache_miss_tokens": agent_trace.total_prompt_cache_miss_tokens,
             "total_mcp_calls": agent_trace.total_mcp_calls,
             "total_mcp_failures": agent_trace.total_mcp_failures,
             "slowest_span": slowest_span.name if slowest_span else "",

@@ -6,6 +6,7 @@ from typing import Any, Mapping
 from sqlalchemy.exc import SQLAlchemyError
 
 from nl2sql.executor import ReadOnlyExecutor
+from nl2sql.prompt_registry import default_registry
 from nl2sql.schema_registry import build_schema_prompt
 from nl2sql.sql_sandbox import SQLValidator
 
@@ -20,11 +21,12 @@ class NL2SQLPipeline:
         validator: SQLValidator,
         executor: ReadOnlyExecutor,
         max_attempts: int = 2,
+        prompt_version: str = "v1.0",
     ) -> None:
-        """输入：SQL 生成器、校验器、只读执行器和最大尝试次数。
+        """输入：SQL 生成器、校验器、只读执行器、最大尝试次数和已部署 Prompt 版本。
 
         输出：初始化后的 NL2SQL 管道实例状态。
-        功能：组合可替换的生成、校验和执行组件，并校验重试次数。
+        功能：组合生成、校验和执行组件，校验重试次数，并固定运行时使用的已评估 Prompt 版本。
         """
         if max_attempts < 1:
             raise ValueError("max_attempts 必须大于或等于1")
@@ -32,6 +34,9 @@ class NL2SQLPipeline:
         self.validator = validator
         self.executor = executor
         self.max_attempts = max_attempts
+        self.prompt_version = prompt_version.strip()
+        if not self.prompt_version:
+            raise ValueError("prompt_version 不能为空")
 
     def run(
         self,
@@ -47,7 +52,9 @@ class NL2SQLPipeline:
         if not question:
             raise ValueError("question 不能为空")
 
-        system_prompt = build_schema_prompt()
+        system_prompt = build_schema_prompt(
+            default_registry().load_prompt("nl2sql", self.prompt_version).content
+        )
         previous_error = ""
         for _attempt in range(self.max_attempts):
             user_prompt = question

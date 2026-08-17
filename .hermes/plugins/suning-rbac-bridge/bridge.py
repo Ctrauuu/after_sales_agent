@@ -18,8 +18,15 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from tools.registry import tool_error, tool_result  # type: ignore
 
+from .mcp_resilience import (
+    DegradeLevel,
+    FailureType,
+    MCPCallManager,
+    MCPCallResult,
+)
 from .observability import _result_rows, observability
 from .schemas import TOOL_SPECS
+from .tool_governor import ToolGovernor
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +79,19 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _attestation_configuration() -> tuple[bytes, str]:
+    """输入：隐式读取 Bridge 密钥和身份签发方环境变量。
+
+    输出：已校验的密钥字节与身份签发方；配置无效时抛出 BridgeConfigurationError。
+    功能：在进入 Manager 前验证稳定配置，避免配置错误被误分类为 MCP 服务失败。
+    """
+
+    secret = _required_env("SUNING_MCP_BRIDGE_SECRET").encode()
+    if len(secret) < MIN_SECRET_BYTES:
+        raise BridgeConfigurationError("SUNING_MCP_BRIDGE_SECRET 长度不足 32 字节")
+    return secret, _required_env("SUNING_IDENTITY_ISSUER")
+
+
 def current_identity() -> dict[str, str]:
     """输入：无；隐式读取 Hermes 当前请求的 ContextVar。
 
@@ -109,15 +129,13 @@ def mint_attestation(*, tool_name: str, identity: dict[str, str]) -> str:
     绑定当前调用：token 里写了 tool_name，给 search_orders 的凭证不能随便拿去调用其他工具。
     """
 
-    secret = _required_env("SUNING_MCP_BRIDGE_SECRET").encode()
-    if len(secret) < MIN_SECRET_BYTES:
-        raise BridgeConfigurationError("SUNING_MCP_BRIDGE_SECRET 长度不足 32 字节")
+    secret, identity_issuer = _attestation_configuration()
 
     now = int(time.time())
     claims = {
         "iss": TOKEN_ISSUER,
         "aud": TOKEN_AUDIENCE,
-        "identity_issuer": _required_env("SUNING_IDENTITY_ISSUER"),
+        "identity_issuer": identity_issuer,
         "platform": identity["platform"],
         "sub": identity["external_subject"],
         "chat_type": identity["chat_type"],
@@ -174,11 +192,78 @@ def _successful_result(result: Any) -> str:
     )
 
 
-async def invoke_business_tool(tool_name: str, arguments: dict[str, Any]) -> str:
-    """输入：白名单工具名 ``tool_name`` 和模型生成的业务参数 ``arguments``。
+def _empty_payload(result: Any) -> Any:
+    """输入：Manager 判定为合法 EMPTY_RESULT 的原始 MCP Result。
+
+    输出：结构化内容、解析后的 JSON 文本或原始空值。
+    功能：为 L2 empty 信封保留已有数据结构，不把成功空查询改成服务失败。
+    """
+
+    if result is None or isinstance(result, (dict, list)):
+        return result
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        return structured
+    text = _result_text(result)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _hermes_result(result: MCPCallResult) -> str:
+    """输入：Manager 返回的标准 ``MCPCallResult``。
+
+    输出：现有 Hermes registry 接受的 tool_result 或 tool_error 字符串。
+    功能：保持普通成功负载，并转换 L1/L2/L3 降级和 L2 合法空结果。
+    """
+
+    if result.success:
+        if (
+            result.error_type is FailureType.EMPTY_RESULT
+            and result.degrade_level is DegradeLevel.L2_CORE
+        ):
+            return tool_result(
+                {
+                    "status": "empty",
+                    "available": True,
+                    "degrade_level": result.degrade_level.value,
+                    "tool_name": result.tool_name,
+                    "failure_type": result.error_type.value,
+                    "data": _empty_payload(result.data),
+                    "notice": f"核心数据「{result.tool_name}」查询成功但未返回记录。",
+                }
+            )
+        return _successful_result(result.data)
+
+    if result.degrade_level is DegradeLevel.L3_CRITICAL:
+        return tool_error("关键数据服务暂不可用，请稍后重试。")
+    return tool_result(
+        {
+            "status": "degraded",
+            "available": False,
+            "degrade_level": result.degrade_level.value,
+            "tool_name": result.tool_name,
+            "failure_type": (
+                result.error_type.value if result.error_type is not None else "UNKNOWN"
+            ),
+            "notice": result.degrade_note,
+        }
+    )
+
+
+async def invoke_business_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    call_manager: MCPCallManager,
+    tool_governor: ToolGovernor | None = None,
+) -> str:
+    """输入：白名单工具名、模型业务参数、注册阶段注入的 MCPCallManager 与可选治理器。
 
     输出：Hermes 可消费的成功结果或安全错误结果。
-    功能：读取真实身份、签发凭证，并通过插件内 MCP Client 调用私有服务。
+    功能：在 Bridge attempt 内重签身份并由 Manager 统一执行重试、熔断和结果转换。
     """
     spec = TOOL_SPECS.get(tool_name)
     if spec is None:
@@ -186,12 +271,24 @@ async def invoke_business_tool(tool_name: str, arguments: dict[str, Any]) -> str
 
     try:
         identity = current_identity()
-        attestation = mint_attestation(tool_name=tool_name, identity=identity)
+        _attestation_configuration()
     except PermissionError as exc:
         return tool_error(str(exc))
     except BridgeConfigurationError:
         logger.exception("苏宁业务身份桥接配置不完整")
         return tool_error("苏宁业务身份桥接配置不完整，请联系管理员")
+
+    cache_scope = f"{identity['platform']}:{identity['external_subject']}"
+    if tool_governor is not None:
+        decision = tool_governor.preflight(
+            tool_name=tool_name,
+            params=arguments,
+            cache_scope=cache_scope,
+        )
+        if decision.error:
+            return tool_error(decision.error)
+        if decision.cached_result is not None:
+            return decision.cached_result
 
     trace_record, owns_trace = observability.ensure_trace(
         conversation_id=identity["message_id"] or f"mcp:{tool_name}",
@@ -204,33 +301,60 @@ async def invoke_business_tool(tool_name: str, arguments: dict[str, Any]) -> str
     success = False
     rows_returned = 0
     error = ""
-    # streamable_http_client
-    #      ↓
-    # 负责建立 HTTP 通信连接
+    call_result: MCPCallResult | None = None
 
-    # ClientSession
-    #      ↓
-    # 在这个连接上提供 MCP 协议操作
-    try:
+    async def attempt() -> Any:
+        """输入：闭包捕获的可信身份、Tool、参数、Endpoint 和 Trace ID。
+
+        输出：一次真实 ``ClientSession.call_tool`` 的原始 MCP Result。
+        功能：每次执行重新签发 attestation/JTI、建立 MCP 会话并完成协议调用。
+        """
+
+        attestation = mint_attestation(tool_name=tool_name, identity=identity)
+        metadata = {
+            "suning/authn": attestation,
+            "suning/trace_id": trace_record.trace_id,
+        }
+        observability.inject_trace_metadata(metadata)
         async with streamable_http_client(endpoint) as (read, write, _session_id):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                metadata = {
-                    "suning/authn": attestation,
-                    "suning/trace_id": trace_record.trace_id,
-                }
-                observability.inject_trace_metadata(metadata)
-                result = await session.call_tool(
+                return await session.call_tool(
                     tool_name,
                     arguments=arguments,
                     meta=metadata,
                 )
-        if bool(getattr(result, "isError", False)):
-            error = _result_text(result) or "苏宁业务服务拒绝了本次请求"
-            return tool_error(error)
-        success = True
-        rows_returned = _result_rows(result)
-        return _successful_result(result)
+
+    try:
+        call_result = await call_manager.call(
+            server_id=spec.server_id,
+            tool_name=tool_name,
+            degrade_level=spec.degrade_level,
+            retry_on_timeout=spec.retry_on_timeout,
+            empty_result_is_success=spec.empty_result_is_success,
+            attempt=attempt,
+        )
+        success = call_result.success
+        error = call_result.error_message
+        if call_result.success:
+            rows_returned = _result_rows(call_result.data)
+        elif call_result.error_message:
+            logger.warning(
+                "调用苏宁 MCP 最终失败: tool=%s endpoint=%s failure_type=%s error=%s",
+                tool_name,
+                endpoint,
+                call_result.error_type.value if call_result.error_type else "UNKNOWN",
+                call_result.error_message,
+            )
+        response = _hermes_result(call_result)
+        if tool_governor is not None and call_result.success:
+            tool_governor.cache_success(
+                tool_name=tool_name,
+                params=arguments,
+                cache_scope=cache_scope,
+                result=response,
+            )
+        return response
     except Exception as exc:
         error = str(exc)
         logger.exception("调用苏宁 MCP 失败: tool=%s endpoint=%s", tool_name, endpoint)
@@ -241,6 +365,15 @@ async def invoke_business_tool(tool_name: str, arguments: dict[str, Any]) -> str
             rows_returned=rows_returned,
             success=success,
             error=error,
+            retry_count=call_result.retry_count if call_result else 0,
+            failure_type=(
+                call_result.error_type.value
+                if call_result and call_result.error_type is not None
+                else ""
+            ),
+            circuit_state=call_result.circuit_state.value if call_result else "",
+            degrade_level=call_result.degrade_level.value if call_result else "",
+            degraded=call_result.degraded if call_result else False,
         )
         if owns_trace:
             observability.finish_trace(trace_record, "MCP 调用完成" if success else "MCP 调用失败")
@@ -249,11 +382,15 @@ async def invoke_business_tool(tool_name: str, arguments: dict[str, Any]) -> str
 Handler = Callable[[dict[str, Any]], Coroutine[Any, Any, str]]
 
 
-def make_handler(tool_name: str) -> Handler:
-    """输入：需要绑定的白名单工具名 ``tool_name``。
+def make_handler(
+    tool_name: str,
+    call_manager: MCPCallManager,
+    tool_governor: ToolGovernor | None = None,
+) -> Handler:
+    """输入：需要绑定的白名单工具名、MCPCallManager 与可选调用治理器。
 
     输出：符合 Hermes registry 调用约定的异步 Handler。
-    功能：为每个工具创建闭包，将调用统一转发给身份桥接入口。
+    功能：为每个工具创建闭包，并复用同一个 Manager 转发身份桥接调用。
     """
 
     async def handler(args: dict[str, Any], **_kwargs: Any) -> str:
@@ -262,7 +399,12 @@ def make_handler(tool_name: str) -> Handler:
         输出：私有 MCP 调用转换后的 Hermes 工具结果。
         功能：执行当前 ``tool_name`` 对应的身份桥接调用。
         """
-        return await invoke_business_tool(tool_name, dict(args or {}))
+        return await invoke_business_tool(
+            tool_name,
+            dict(args or {}),
+            call_manager,
+            tool_governor,
+        )
 
     return handler
 

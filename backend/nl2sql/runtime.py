@@ -18,7 +18,21 @@ nl2sql_pipeline = NL2SQLPipeline(
     validator=SQLValidator(),
     executor=ReadOnlyExecutor(engine),
     max_attempts=2,
+    prompt_version=settings.nl2sql_prompt_version,
+)
+
+nl2sql_lite_pipeline = NL2SQLPipeline(
+    generator=DeepSeekSQLGenerator(
+        api_key=settings.deepseek_api,
+        base_url=settings.deepseek_base_url,
+        model=settings.deepseek_lite_model,
+        timeout_seconds=settings.nl2sql_timeout_seconds,
+    ),
+    validator=SQLValidator(),
+    executor=ReadOnlyExecutor(engine),
+    max_attempts=2,
+    prompt_version=settings.nl2sql_prompt_version,
 )
 
 
-__all__ = ["nl2sql_pipeline"]
+__all__ = ["nl2sql_lite_pipeline", "nl2sql_pipeline"]

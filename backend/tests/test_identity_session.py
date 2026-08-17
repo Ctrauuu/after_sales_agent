@@ -69,6 +69,22 @@ class _FakeRedis:
         self.expirations[key] = seconds
         return True
 
+    def eval(self, script: str, _numkeys: int, key: str, token: str, *args: str) -> int:
+        """输入：租约 Lua ``script``、键 ``key``、所有者令牌 ``token`` 与可选 TTL 参数。
+
+        输出：比较成功后的 Redis ``EXPIRE`` 或 ``DEL`` 结果；令牌不匹配时返回 ``0``。
+        功能：模拟生产租约的 compare-and-renew 与 compare-and-delete，验证旧回合不能续期或删除新回合的锁。
+        """
+
+        if self.values.get(key) != token:
+            return 0
+        if "expire" in script:
+            self.expirations[key] = int(args[0])
+            return 1
+        del self.values[key]
+        self.expirations.pop(key, None)
+        return 1
+
 
 class _RecordingHooks:
     """记录被统一身份 Hook 转发参数的短期或长期 Hook 替身。"""
@@ -361,6 +377,100 @@ def test_unified_hooks_forward_hermes_identity_and_reject_unknown_user(
     assert len(memory.post_calls) == 1
 
 
+def test_unified_hooks_serialize_cross_platform_turns_before_context_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：共享 Redis、同一内部用户的飞书/企微私聊以及两个独立 Hook 请求上下文。
+
+    输出：无；并发回合读取或写入共享逻辑会话、或旧租约释放后不能继续时通过断言报告失败。
+    功能：验证 Redis 令牌租约让同一用户跨平台同一时刻只有一个回合可执行，后到请求不触发上下文读改写和工具副作用。
+    """
+
+    identity, session_values = _load_identity_session(monkeypatch)
+    monkeypatch.setattr(identity, "TURN_LEASE_WAIT_SECONDS", 0.0)
+    redis_client = _FakeRedis()
+    router = identity.IdentitySessionRouter(_identity_engine(), redis_client)
+    first_conversation = _RecordingHooks("第一回合上下文")
+    second_conversation = _RecordingHooks("第二回合上下文")
+    first_hooks = identity.UnifiedIdentityHooks(router, first_conversation)
+    second_hooks = identity.UnifiedIdentityHooks(router, second_conversation)
+
+    session_values.update(
+        {
+            "HERMES_SESSION_PLATFORM": "feishu",
+            "HERMES_SESSION_USER_ID": "ou_zhang",
+            "HERMES_SESSION_CHAT_TYPE": "dm",
+        }
+    )
+    first_hooks.pre_llm_call(session_id="feishu-session", user_message="飞书请求")
+
+    session_values.update(
+        {
+            "HERMES_SESSION_PLATFORM": "wecom",
+            "HERMES_SESSION_USER_ID": "zhangsan",
+            "HERMES_SESSION_CHAT_TYPE": "direct",
+        }
+    )
+    queued = second_hooks.pre_llm_call(session_id="wecom-session", user_message="企微请求")
+
+    assert queued is not None
+    assert second_conversation.pre_calls == []
+    assert second_hooks.transform_llm_output(response_text="模型原回答") == identity.CONCURRENT_TURN_REPLY
+    assert second_hooks.pre_tool_call(tool_name="send_aftersale_chart") == {
+        "action": "block",
+        "message": "工具 send_aftersale_chart 已被阻止："
+        f"{identity.CONCURRENT_TURN_REPLY}",
+    }
+
+    first_hooks.post_llm_call(session_id="feishu-session", assistant_response="飞书完成")
+    second_hooks.pre_llm_call(session_id="wecom-session", user_message="企微重试")
+    second_hooks.post_llm_call(session_id="wecom-session", assistant_response="企微完成")
+
+    assert len(first_conversation.pre_calls) == 1
+    assert len(first_conversation.post_calls) == 1
+    assert len(second_conversation.pre_calls) == 1
+    assert len(second_conversation.post_calls) == 1
+    assert (
+        first_conversation.post_calls[0]["session_id"]
+        == second_conversation.post_calls[0]["session_id"]
+    )
+    assert not [key for key in redis_client.values if key.startswith("im:turn-lease:")]
+
+
+def test_session_end_releases_turn_lease_after_interrupted_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：可信私聊、共享 Redis 和模拟的 Hermes 中断回合结束事件。
+
+    输出：无；中断回合遗留租约或后续回合无法获取租约时通过断言报告失败。
+    功能：验证 ``on_session_end`` 覆盖没有 ``post_llm_call`` 的异常路径，避免一个失败请求阻塞同一用户后续跨平台会话。
+    """
+
+    identity, session_values = _load_identity_session(monkeypatch)
+    monkeypatch.setattr(identity, "TURN_LEASE_WAIT_SECONDS", 0.0)
+    redis_client = _FakeRedis()
+    router = identity.IdentitySessionRouter(_identity_engine(), redis_client)
+    interrupted_hooks = identity.UnifiedIdentityHooks(router, _RecordingHooks(""))
+    retry_conversation = _RecordingHooks("重试上下文")
+    retry_hooks = identity.UnifiedIdentityHooks(router, retry_conversation)
+    session_values.update(
+        {
+            "HERMES_SESSION_PLATFORM": "dingtalk",
+            "HERMES_SESSION_USER_ID": "ding_zhang",
+            "HERMES_SESSION_CHAT_TYPE": "private",
+        }
+    )
+
+    interrupted_hooks.pre_llm_call(session_id="ding-session", user_message="会中断的请求")
+    interrupted_hooks.on_session_end(failed=True, interrupted=True)
+    assert not [key for key in redis_client.values if key.startswith("im:turn-lease:")]
+    retry_hooks.pre_llm_call(session_id="ding-session-2", user_message="后续请求")
+
+    assert len(retry_conversation.pre_calls) == 1
+    retry_hooks.on_session_end(completed=True)
+    assert not [key for key in redis_client.values if key.startswith("im:turn-lease:")]
+
+
 def test_unified_hooks_record_real_api_usage_not_turn_duration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -391,7 +501,12 @@ def test_unified_hooks_record_real_api_usage_not_turn_duration(
         api_request_id="api-1",
         response_model="deepseek-v4-flash",
         api_duration=0.42,
-        usage={"input_tokens": 120, "output_tokens": 45},
+        usage={
+            "input_tokens": 120,
+            "output_tokens": 45,
+            "prompt_cache_hit_tokens": 100,
+            "prompt_cache_miss_tokens": 20,
+        },
     )
     hooks.post_llm_call(session_id="feishu-session", assistant_response="结果")
 
@@ -401,6 +516,8 @@ def test_unified_hooks_record_real_api_usage_not_turn_duration(
             "span": "api_request",
             "prompt_tokens": 120,
             "completion_tokens": 45,
+            "prompt_cache_hit_tokens": 100,
+            "prompt_cache_miss_tokens": 20,
             "model": "deepseek-v4-flash",
             "duration_ms": 420.0,
         }

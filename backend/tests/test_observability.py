@@ -56,6 +56,8 @@ def test_trace_aggregates_llm_mcp_failure_and_resets_context(caplog: Any) -> Non
             llm_span,
             prompt_tokens=150,
             completion_tokens=80,
+            prompt_cache_hit_tokens=120,
+            prompt_cache_miss_tokens=30,
             model="deepseek",
         )
         successful_mcp = client.start_mcp_span("get_order_detail", "mcp-order")
@@ -66,13 +68,32 @@ def test_trace_aggregates_llm_mcp_failure_and_resets_context(caplog: Any) -> Non
             rows_returned=0,
             success=False,
             error="连接超时",
+            retry_count=2,
+            failure_type="TIMEOUT",
+            circuit_state="CLOSED",
+            degrade_level="L2_CORE",
+            degraded=True,
         )
         summary = client.finish_trace(trace_record, "订单仍在物流环节")
 
     assert summary["total_llm_tokens"] == 230
+    assert summary["total_prompt_cache_hit_tokens"] == 120
+    assert summary["total_prompt_cache_miss_tokens"] == 30
     assert summary["total_mcp_calls"] == 2
     assert summary["total_mcp_failures"] == 1
     assert summary["trace_id"] == trace_record.trace_id
+    assert failed_mcp.attributes == {
+        "tool_name": "query_logistics",
+        "server": "mcp-logistics",
+        "rows_returned": 0,
+        "success": False,
+        "degraded": True,
+        "retry_count": 2,
+        "failure_type": "TIMEOUT",
+        "circuit_state": "CLOSED",
+        "degrade_level": "L2_CORE",
+        "error_message": "连接超时",
+    }
     assert module.current_trace_id.get() == ""
     assert any("suning_agent_trace" in record.message for record in caplog.records)
 

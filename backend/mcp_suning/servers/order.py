@@ -5,7 +5,7 @@ from typing import Any
 import sqlalchemy as sa
 from fastmcp import Context, FastMCP
 
-from mcp_suning.auth_middleware import (
+from mcp_suning.security.rbac import (
     CATEGORY_ALIASES,
     REGION_ALIASES,
     authorize_mcp_request,

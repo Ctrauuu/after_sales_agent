@@ -275,6 +275,35 @@ def test_dashscope_embedding_uses_bounded_timeout_and_locks_dimension() -> None:
     )
 
 
+def test_dashscope_embedding_batches_trigger_patterns_by_ten() -> None:
+    """输入：十一条触发语句与分别返回十条、一条向量的 DashScope 调用替身。
+
+    输出：无；断言按原输入顺序返回全部向量且 SDK 调用被拆为两批。
+    功能：验证路由预热遵守 DashScope 同步 Embedding 的单批上限，不会在大量 Skill 问法时被接口拒绝。
+    """
+
+    def response(count: int) -> dict[str, object]:
+        """输入：本批要返回的向量数量 ``count``。
+
+        输出：含 ``count`` 条二维向量的 DashScope 成功响应字典。
+        功能：为批量边界测试构造与 SDK 返回结构相同的最小响应。
+        """
+
+        return {
+            "status_code": 200,
+            "output": {"embeddings": [{"embedding": [index, 1]} for index in range(count)]},
+        }
+    caller = Mock(side_effect=[response(10), response(1)])
+    embedder = DashScopeEmbeddingClient("test-key", caller=caller)
+
+    vectors = embedder.embed_many([f"退单问法{index}" for index in range(11)])
+
+    assert len(vectors) == 11
+    assert caller.call_count == 2
+    assert len(caller.call_args_list[0].kwargs["input"]) == 10
+    assert len(caller.call_args_list[1].kwargs["input"]) == 1
+
+
 def test_embedding_and_milvus_reject_non_finite_vectors() -> None:
     """输入：分别含 NaN 和 Infinity 的模型响应及 Milvus 查询向量。
 

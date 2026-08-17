@@ -7,12 +7,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from mcp_suning.order_timeline import (
+from mcp_suning.timeline.tracker import (
     OrderTimelineTracker,
     parse_timestamp,
     select_sla_config,
 )
-from mcp_suning.timeline_client import _result_payload
+from mcp_suning.timeline.gateway import _result_payload
 
 
 def _clock() -> datetime:

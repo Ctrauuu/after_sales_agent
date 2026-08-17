@@ -19,6 +19,7 @@ from .long_memory_models import MemoryRecord, canonical_json
 
 
 _QUERY_WORDS = re.compile(r"[A-Za-z0-9_-]{3,}|[\u3400-\u9fff]+")
+_EMBEDDING_BATCH_SIZE = 10
 
 
 class SQLiteMemoryStore:
@@ -306,38 +307,62 @@ class DashScopeEmbeddingClient:
         """输入：需要编码的非空文本 ``text``。
 
         输出：有限浮点数构成的 Embedding 向量；服务失败或维度变化时抛出 ``RuntimeError``。
-        功能：调用 DashScope 并校验返回向量可安全写入 Milvus。
+        功能：复用批量调用的单条入口，兼容长期记忆等已有调用方。
         """
 
-        if not text.strip():
+        return self.embed_many([text])[0]
+
+    def embed_many(self, texts: Sequence[str]) -> list[list[float]]:
+        """输入：需要编码的非空文本序列 ``texts``。
+
+        输出：与输入顺序一致的有限浮点向量列表；服务失败、数量不符或维度变化时抛出 ``RuntimeError``。
+        功能：按 DashScope 的十条上限批量生成触发语句向量，避免语义路由在冷启动时按样本串行等待网络响应。
+        """
+
+        inputs = [str(text).strip() for text in texts]
+        if not inputs:
+            return []
+        if any(not text for text in inputs):
             raise ValueError("Embedding 文本不能为空")
-        response = self.caller(
-            model=self.model,
-            input=[text],
-            api_key=self.api_key,
-            request_timeout=self.timeout_seconds,
-        )
-        status_code = (
-            response["status_code"] if isinstance(response, dict) else response.status_code
-        )
-        if status_code != HTTPStatus.OK:
-            code = response["code"] if isinstance(response, dict) else response.code
-            message = response["message"] if isinstance(response, dict) else response.message
-            raise RuntimeError(
-                f"DashScope Embedding 调用失败: {code}: {message}"
+        vectors: list[list[float]] = []
+        for start in range(0, len(inputs), _EMBEDDING_BATCH_SIZE):
+            batch = inputs[start : start + _EMBEDDING_BATCH_SIZE]
+            response = self.caller(
+                model=self.model,
+                input=batch,
+                api_key=self.api_key,
+                request_timeout=self.timeout_seconds,
             )
-        output = response["output"] if isinstance(response, dict) else response.output
-        raw_vector = output["embeddings"][0]["embedding"]
-        vector = [float(value) for value in raw_vector]
-        if not vector:
+            status_code = (
+                response["status_code"] if isinstance(response, dict) else response.status_code
+            )
+            if status_code != HTTPStatus.OK:
+                code = response["code"] if isinstance(response, dict) else response.code
+                message = response["message"] if isinstance(response, dict) else response.message
+                raise RuntimeError(
+                    f"DashScope Embedding 调用失败: {code}: {message}"
+                )
+            output = response["output"] if isinstance(response, dict) else response.output
+            raw_vectors = output["embeddings"]
+            if len(raw_vectors) != len(batch):
+                raise RuntimeError("DashScope Embedding 返回数量与输入不一致")
+            vectors.extend(
+                [float(value) for value in item["embedding"]]
+                for item in raw_vectors
+            )
+        if any(not vector for vector in vectors):
             raise RuntimeError("DashScope Embedding 返回了空向量")
-        if not all(math.isfinite(value) for value in vector):
+        if not all(math.isfinite(value) for vector in vectors for value in vector):
             raise RuntimeError("DashScope Embedding 向量包含非有限数值")
+        dimensions = {len(vector) for vector in vectors}
+        if len(dimensions) != 1:
+            raise RuntimeError("DashScope Embedding 返回向量维度不一致")
+        dimension = dimensions.pop()
         if self.dimension is None:
-            self.dimension = len(vector)
-        elif self.dimension != len(vector):
+            self.dimension = dimension
+        elif self.dimension != dimension:
             raise RuntimeError("Embedding 向量维度发生变化")
-        return vector
+        return vectors
 
 
 class MilvusVectorStore:

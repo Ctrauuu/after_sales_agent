@@ -1,7 +1,7 @@
 """集中保存权限校验和 NL2SQL Prompt 共用的业务编码映射。"""
 
 
-REGION_ALIASES = {"华东": "HD", "华北": "HB", "华南": "HN"}
+REGION_ALIASES = {"华东": "HD", "华北": "HB", "华南": "HN", "西南": "XN"}
 
 CATEGORY_ALIASES = {
     "大家电": "C1",

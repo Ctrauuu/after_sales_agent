@@ -19,7 +19,7 @@
 ```bash
 cd backend
 uv sync
-uv run python -m mcp_suning.order_server
+uv run python -m mcp_suning.servers.order
 ```
 
 后端从 `backend/.env` 读取数据库配置。首次配置时可以复制

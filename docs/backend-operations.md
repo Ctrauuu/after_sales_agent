@@ -122,8 +122,33 @@ cd /home/ctrau/suning-hermes-agent/backend
 然后按模块启动：
 
 ```bash
-uv run python -m mcp_suning.order_server
+uv run python -m mcp_suning.servers.order
 ```
+
+### 8.1 使用 systemd 统一管理全部 MCP
+
+仓库提供 `backend/infra/systemd/suning-mcp@.service` 模板和 `suning-mcp.target`。安装后，一个
+target 会管理 `order`、`aftersale`、`product`、`logistics`、`payment`、`timeline` 六个实例：
+
+```bash
+cd /home/ctrau/suning-hermes-agent/backend
+sudo install -m 0644 infra/systemd/suning-mcp@.service /etc/systemd/system/
+sudo install -m 0644 infra/systemd/suning-mcp.target /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now suning-mcp.target
+```
+
+常用操作：
+
+```bash
+systemctl status 'suning-mcp@*.service'
+sudo systemctl restart suning-mcp.target
+sudo systemctl stop suning-mcp.target
+journalctl -u suning-mcp@timeline.service -f
+```
+
+模板使用 `/home/ctrau/suning-hermes-agent/backend/.venv`、`backend/.env` 和用户 `ctrau`。若部署
+位置或运行用户不同，安装前修改模板中的路径、`User` 与 `Group`。
 
 ### 9. 检查 Docker 是否正常
 

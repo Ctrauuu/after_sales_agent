@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     # Redis 只用于一次性身份凭证防重放，不缓存角色策略。
     redis_url: str = ""
 
+    # 管理后台只读 Hermes 状态并写现有 Skill Hub；令牌为空时仅允许环回访问。
+    suning_admin_api_token: str = ""
+    hermes_home: str = "~/.hermes"
+    skill_evolution_dir: str = ""
+
     # Hermes 插件与 MCP 之间的身份凭证配置
     suning_mcp_bridge_secret: str = ""
     suning_identity_issuer: str = ""
@@ -38,7 +43,9 @@ class Settings(BaseSettings):
     deepseek_api: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
+    deepseek_lite_model: str = "deepseek-v4-flash"
     nl2sql_timeout_seconds: float = 30.0
+    nl2sql_prompt_version: str = "v1.0"
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

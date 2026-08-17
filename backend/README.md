@@ -31,13 +31,35 @@ cp .env.example .env
 六个服务分别监听 8101～8106：
 
 ```bash
-uv run python -m mcp_suning.order_server
-uv run python -m mcp_suning.aftersale_server
-uv run python -m mcp_suning.product_server
-uv run python -m mcp_suning.logistics_server
-uv run python -m mcp_suning.payment_server
-uv run python -m mcp_suning.order_timeline_server
+uv run python -m mcp_suning.servers.order
+uv run python -m mcp_suning.servers.aftersale
+uv run python -m mcp_suning.servers.product
+uv run python -m mcp_suning.servers.logistics
+uv run python -m mcp_suning.servers.payment
+uv run python -m mcp_suning.servers.timeline
 ```
+
+生产机使用一个模板服务和一个 target 统一管理六个实例：
+
+```bash
+sudo install -m 0644 infra/systemd/suning-mcp@.service /etc/systemd/system/
+sudo install -m 0644 infra/systemd/suning-mcp.target /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now suning-mcp.target
+```
+
+统一启停和查看状态：
+
+```bash
+sudo systemctl restart suning-mcp.target
+sudo systemctl stop suning-mcp.target
+systemctl status 'suning-mcp@*.service'
+journalctl -u suning-mcp@order.service -f
+```
+
+模板按当前部署位置 `/home/ctrau/suning-hermes-agent` 和运行用户 `ctrau` 配置，并从
+`backend/.env` 读取所有 MCP 共用环境变量。部署到其他位置或用户时，只需修改模板中的三处路径及
+`User`、`Group`，不复制单独的 service 文件。
 
 动态分析工具 `query_return_stats_nl2sql` 和 `query_aftersale_nl2sql` 共用
 `nl2sql.runtime.nl2sql_pipeline`。订单搜索/详情、售后流程、商品、物流和退款状态等明确业务 API
@@ -46,7 +68,15 @@ uv run python -m mcp_suning.order_timeline_server
 ## MCP 调用链路观测
 
 桥接插件会在每个 Agent 回合创建 `trace_id`，自动记录 LLM 耗时与可用 Token 用量，以及所有私有
-MCP 的服务地址、耗时、返回行数和失败原因。Span 批量导出至
+MCP 的服务地址、耗时、返回行数和失败原因。`TOOL_SPECS` 中的 MCP Tool 统一经过插件注册时创建的
+`MCPCallManager`：仅对显式允许重试的超时执行最多 3 次重试（1/2/4 秒退避并附加 0～200ms
+抖动），且每次真实请求都会重新签发 attestation/JTI。熔断状态按稳定的 `server_id` 存入现有
+Redis；60 秒内 5 次可计数失败会熔断 30 秒，半开时只允许一个跨进程探测，Redis 不可用时调用链
+fail-open。L1/L2 降级保留为结构化 `tool_result` 并进入复杂分析摘要，L3 返回安全的
+`tool_error`；合法空结果和时间线的 `partial/source_failures` 不计入服务故障。
+
+MCP Span 额外记录 `retry_count`、`failure_type`、`circuit_state`、`degrade_level`、最终成功状态和
+是否降级。Span 批量导出至
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`（在 `.env.example` 中配置为 `http://127.0.0.1:4318/v1/traces`）；汇总指标以
 `suning_agent_trace` JSON 写入 Hermes 日志。单条 Trace 墙钟耗时超过 30 秒或 Token 超过 50K 时写入
 `suning_agent_trace_alert`，供现有日志告警链路转发至飞书。
@@ -104,7 +134,23 @@ mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migr
 mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migrations/004_register_order_timeline.sql
 ```
 
-随后重启 `mcp_suning.aftersale_server`，并刷新 Hermes 的 MCP Tool 列表。
+随后重启 `mcp_suning.servers.aftersale`，并刷新 Hermes 的 MCP Tool 列表。
+
+## 管理后台 API
+
+FastAPI 管理服务直接复用现有数据源：用户、角色、IM 绑定和 MCP 注册表读写 MySQL；对话审计和仪表盘只读
+Hermes `state.db` 与结构化日志；Skill 管理原子更新 `.hermes/skills/evolved`。启动：
+
+```bash
+uv run uvicorn suning_hermes_agent.admin_api:app --host 127.0.0.1 --port 8080
+```
+
+实现位于 `src/suning_hermes_agent/admin/`：`app.py` 负责应用组装，`common.py` 和 `runtime.py`
+承载跨域基础设施，其余模块按用户、MCP、会话、Skill、看板业务域组织；`admin_api.py` 仅保留兼容启动入口。
+
+本机开发可由 Vite 代理直接访问。远程部署必须配置 `SUNING_ADMIN_API_TOKEN`，并由同源反向代理注入
+`Authorization: Bearer <token>`。工具开关同时写入 MySQL 和共享 Redis，Agent 下一次调用即时生效；
+Skill 启停写回现有 Skill 文件，下一轮路由即时生效。
 
 ## 测试
 

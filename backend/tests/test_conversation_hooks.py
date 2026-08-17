@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import importlib.util
 import runpy
 import sys
@@ -489,6 +490,51 @@ def test_plugin_registers_pre_and_post_llm_hooks() -> None:
     }
 
 
+def test_conversation_runtime_reuses_injected_redis_client(monkeypatch: Any) -> None:
+    """输入：已构建 Redis Client、最小环境配置和构造器替身。
+
+    输出：无；重复创建 Redis Client 或未返回注入实例时断言失败。
+    功能：验证 Phase 2 提取的共享 Client 入口不会为 Context 再建连接池。
+    """
+
+    module = runpy.run_path(str(PLUGIN_HOOKS))
+    build_runtime = module["build_conversation_runtime"]
+    runtime_globals = build_runtime.__globals__
+    existing_redis = object()
+    redis_from_url = Mock(side_effect=AssertionError("不应重复创建 Redis Client"))
+    monkeypatch.setattr(module["redis"].Redis, "from_url", redis_from_url)
+    for name, value in {
+        "MYSQL_USER": "user",
+        "MYSQL_PASSWORD": "password",
+        "MYSQL_HOST": "127.0.0.1",
+        "MYSQL_PORT": "3306",
+        "MYSQL_DATABASE": "suning",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    database_engine = object()
+    monkeypatch.setitem(
+        runtime_globals,
+        "create_engine",
+        Mock(return_value=database_engine),
+    )
+    monkeypatch.setitem(runtime_globals, "create_model", Mock(return_value=object()))
+    monkeypatch.setitem(runtime_globals, "ContextManager", Mock(return_value=object()))
+    monkeypatch.setitem(
+        runtime_globals,
+        "DatabaseWhitelistLoader",
+        Mock(return_value=object()),
+    )
+    monkeypatch.setitem(runtime_globals, "SlotExtractor", Mock(return_value=object()))
+    monkeypatch.setitem(runtime_globals, "ConversationHooks", Mock(return_value=object()))
+
+    _, returned_redis, returned_engine = build_runtime(existing_redis)
+
+    assert returned_redis is existing_redis
+    assert returned_engine is database_engine
+    redis_from_url.assert_not_called()
+
+
 def test_plugin_keeps_rbac_tools_when_context_env_is_missing(
     monkeypatch: Any,
 ) -> None:
@@ -518,3 +564,36 @@ def test_plugin_keeps_rbac_tools_when_context_env_is_missing(
         "orchestrate_aftersale_analysis",
     }
     assert plugin_context.hooks == {}
+
+
+def test_plugin_reuses_one_manager_and_redis_client_for_all_mcp_handlers(
+    monkeypatch: Any,
+) -> None:
+    """输入：真实插件入口、共享 Redis 替身和构造器 Mock。
+
+    输出：无；Manager/Redis 重建或任一 MCP Handler 未获同一 Manager 时断言失败。
+    功能：锁定 Phase 3 的 register → Redis → Manager → make_handler 生命周期。
+    """
+
+    plugin = _load_plugin_package(monkeypatch)
+    context_hooks = importlib.import_module(f"{plugin.__name__}.context_hooks")
+    redis_client = object()
+    manager = object()
+    build_redis_client = Mock(return_value=redis_client)
+    build_runtime = Mock(side_effect=RuntimeError("stop after bridge registration"))
+    manager_constructor = Mock(return_value=manager)
+    make_handler = Mock(return_value=Mock())
+    monkeypatch.setattr(context_hooks, "build_redis_client", build_redis_client)
+    monkeypatch.setattr(context_hooks, "build_conversation_runtime", build_runtime)
+    monkeypatch.setattr(plugin, "MCPCallManager", manager_constructor)
+    monkeypatch.setattr(plugin, "make_handler", make_handler)
+
+    plugin.register(FakePluginContext())
+
+    build_redis_client.assert_called_once_with()
+    manager_constructor.assert_called_once_with(redis_client)
+    build_runtime.assert_called_once_with(redis_client)
+    assert [call.args[0] for call in make_handler.call_args_list] == list(
+        plugin.TOOL_SPECS
+    )
+    assert all(call.args[1] is manager for call in make_handler.call_args_list)

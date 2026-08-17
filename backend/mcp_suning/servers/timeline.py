@@ -4,15 +4,15 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
-from mcp_suning.auth_middleware import (
+from mcp_suning.security.rbac import (
     authorize_mcp_request_with_principal,
     interceptor,
 )
-from mcp_suning.auth_attestation import _metadata_from_context
+from mcp_suning.security.attestation import _metadata_from_context
 from mcp_suning.config import settings
-from mcp_suning.order_timeline import OrderTimelineTracker
+from mcp_suning.timeline.tracker import OrderTimelineTracker
 from mcp_suning.observability import finish_trace, start_trace
-from mcp_suning.timeline_client import TimelineMCPGateway
+from mcp_suning.timeline.gateway import TimelineMCPGateway
 
 
 mcp = FastMCP("mcp-order-timeline")

@@ -211,7 +211,7 @@ def run(
 “复杂运营数据分析”和“临时统计查询”是 `query_aftersale_nl2sql` 的使用场景，不新增同义 MCP
 Tool，避免 Agent 在多个功能重叠的工具之间误选。
 
-两个动态工具都位于 `backend/mcp_suning/aftersale_server.py`：
+两个动态工具都位于 `backend/mcp_suning/servers/aftersale.py`：
 
 - `query_return_stats_nl2sql` 保留稳定的结构化参数接口。它先鉴权，再把 `group_by`、时间和品类转换为
   受控问题，然后调用共用 Pipeline。当前支持 `day`、`category`、`reason`、`region`、`brand`。
@@ -254,7 +254,7 @@ Hermes 通过 `.hermes/plugins/suning-rbac-bridge` 把这两个工具注册到 `
 | `backend/nl2sql/sql_sandbox.py` | SQL 校验、修正和 RBAC 注入 |
 | `backend/nl2sql/executor.py` | EXPLAIN 和 SELECT |
 | `backend/nl2sql/pipeline.py` | 有限重试和组件编排 |
-| `backend/mcp_suning/aftersale_server.py` | MCP 入口、鉴权、响应脱敏 |
+| `backend/mcp_suning/servers/aftersale.py` | MCP 入口、鉴权、响应脱敏 |
 | `backend/tests/test_nl2sql.py` | NL2SQL 行为测试 |
 
 ## 9. 实现边界

@@ -98,11 +98,11 @@ JOIN_RELATIONS = [
 ]
 
 
-def build_schema_prompt() -> str:
-    """输入：无显式参数；读取模块内 Schema 和 JOIN 注册信息。
+def build_schema_prompt(prompt_template: str | None = None) -> str:
+    """输入：可选的版本化 Prompt 模板 ``prompt_template``，以及模块内 Schema 和 JOIN 注册信息。
 
     输出：交给 SQL 生成模型的 Schema-first System Prompt。
-    功能：集中描述静态表字段、JOIN 关系和生成规则，用户问题由独立消息传入。
+    功能：向版本化完整模板注入当前 Schema、JOIN 和品类映射，用户问题由独立消息传入。
     """
 
     schema_json = json.dumps(
@@ -120,7 +120,7 @@ def build_schema_prompt() -> str:
         ensure_ascii=False,
         indent=2,
     )
-    return f"""
+    template = prompt_template or """
 你是苏宁售后数据分析系统的 MySQL 查询生成器。
 
 只能生成一条 SELECT 查询，不得生成解释、Markdown代码块或其他文字。
@@ -151,11 +151,17 @@ def build_schema_prompt() -> str:
 16. 只输出SQL。
 
 可用Schema：
-{schema_json}
+{{schema_json}}
 
 合法关联：
-{joins_json}
+{{joins_json}}
 
 中文品类与编码映射：
-{categories_json}
-""".strip()
+{{categories_json}}
+"""
+    return (
+        template.replace("{{schema_json}}", schema_json)
+        .replace("{{joins_json}}", joins_json)
+        .replace("{{categories_json}}", categories_json)
+        .strip()
+    )

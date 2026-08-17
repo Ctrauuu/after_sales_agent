@@ -6,8 +6,8 @@ import sqlalchemy as sa
 from fastmcp import Context, FastMCP
 
 # 两个动态分析 Tool 共用 runtime 中的 Pipeline；修改 nl2sql 后需重载本服务。
-from nl2sql.runtime import nl2sql_pipeline
-from mcp_suning.auth_middleware import (
+from nl2sql.runtime import nl2sql_lite_pipeline, nl2sql_pipeline
+from mcp_suning.security.rbac import (
     authorize_mcp_request,
     build_scope_clause,
     interceptor,
@@ -98,7 +98,7 @@ def query_return_stats_nl2sql(
     if requested_category:
         question += f"只统计品类 {requested_category} 及其子品类。"
 
-    result = nl2sql_pipeline.run(question, safe_filters)
+    result = nl2sql_lite_pipeline.run(question, safe_filters)
     return interceptor.mask_sensitive_data(
         result["rows"],
         safe_filters["data_scope"],

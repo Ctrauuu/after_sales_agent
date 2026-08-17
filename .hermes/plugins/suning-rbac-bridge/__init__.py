@@ -6,9 +6,11 @@ import logging
 
 from .bridge import make_handler
 from .charting import CHART_TOOL_SCHEMA, handle_chart
+from .mcp_resilience import MCPCallManager
 from .observability import observability
 from .orchestration import COMPLEX_ANALYSIS_SCHEMA, make_complex_analysis_handler
 from .schemas import TOOL_SPECS
+from .tool_governor import ToolGovernor
 
 
 logger = logging.getLogger(__name__)
@@ -17,16 +19,27 @@ logger = logging.getLogger(__name__)
 def register(ctx) -> None:
     """输入：Hermes 插件上下文 ``ctx``。
 
-    输出：无；注册工具，并在配置完整时依次注册短期上下文、长期记忆和知识检索 Hooks。
-    功能：始终暴露苏宁业务工具；可选记忆或知识库依赖故障时分层降级，不影响已有能力。
+    输出：无；注册共享 Manager 的工具，并在配置完整时注册各层 Hooks。
+    功能：复用单个 Redis Client 装配 MCP 熔断；可选上下文依赖故障时仍保留业务工具。
     """
 
+    redis_client = None
+    build_conversation_runtime = None
+    try:
+        from .context_hooks import build_conversation_runtime, build_redis_client
+
+        redis_client = build_redis_client()
+    except (ImportError, RuntimeError, ValueError):
+        logger.exception("Redis 配置不完整，MCP 熔断已 fail-open 并跳过上下文 Hooks")
+
+    call_manager = MCPCallManager(redis_client)
+    tool_governor = ToolGovernor(redis_client)
     for tool_name, spec in TOOL_SPECS.items():
         ctx.register_tool(
             name=tool_name,
             toolset="suning_business",
             schema=spec.schema,
-            handler=make_handler(tool_name),
+            handler=make_handler(tool_name, call_manager, tool_governor),
             is_async=True,
             description=str(spec.schema["description"]),
             emoji="🛡️",
@@ -49,10 +62,12 @@ def register(ctx) -> None:
         description=str(COMPLEX_ANALYSIS_SCHEMA["description"]),
         emoji="🧭",
     )
+    if build_conversation_runtime is None or redis_client is None:
+        return
     try:
-        from .context_hooks import build_conversation_runtime
-
-        conversation_hooks, redis_client, database_engine = build_conversation_runtime()
+        conversation_hooks, redis_client, database_engine = build_conversation_runtime(
+            redis_client
+        )
     except (ImportError, RuntimeError, ValueError):
         logger.exception("结构化上下文 Hooks 配置不完整，已保留 RBAC 工具并跳过 Hooks")
         return
@@ -69,7 +84,7 @@ def register(ctx) -> None:
     try:
         from .knowledge_hooks import build_knowledge_hooks
 
-        knowledge_hooks = build_knowledge_hooks(conversation_hooks.manager)
+        knowledge_hooks = build_knowledge_hooks(conversation_hooks.manager, database_engine)
     except Exception:
         logger.exception("售后知识库 Hook 初始化失败，已保留已有业务能力")
 
@@ -93,6 +108,7 @@ def register(ctx) -> None:
         knowledge_hooks,
         skill_hooks,
         observability,
+        tool_governor,
     )
 
     ctx.register_hook("pre_llm_call", identity_hooks.pre_llm_call)
@@ -102,6 +118,7 @@ def register(ctx) -> None:
     ctx.register_hook("post_api_request", identity_hooks.post_api_request)
     ctx.register_hook("api_request_error", identity_hooks.api_request_error)
     ctx.register_hook("transform_llm_output", identity_hooks.transform_llm_output)
+    ctx.register_hook("on_session_end", identity_hooks.on_session_end)
 
 
 __all__ = ["register"]

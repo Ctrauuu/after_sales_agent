@@ -66,6 +66,15 @@ class _FakeLlm:
 class _FakeEmbedder:
     """让相同售后描述稳定命中的轻量 Embedding 替身。"""
 
+    def __init__(self) -> None:
+        """输入：无；不读取外部服务。
+
+        输出：持有零次批量调用计数的 Embedding 替身。
+        功能：记录语义路由构建索引时是否复用批量客户端接口。
+        """
+
+        self.batch_calls = 0
+
     def embed(self, text: str) -> list[float]:
         """输入：需要比较的 Skill 描述 ``text``。
 
@@ -74,6 +83,16 @@ class _FakeEmbedder:
         """
 
         return [1.0, 0.0] if "退单" in text else [0.0, 1.0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        """输入：需要同时向量化的触发语句 ``texts``。
+
+        输出：与输入顺序对应的确定性二维向量列表。
+        功能：模拟 DashScope 批量接口，并让路由测试验证预热不退化为逐条远程调用。
+        """
+
+        self.batch_calls += 1
+        return [self.embed(text) for text in texts]
 
 
 def _extraction(patterns: list[str], days: int = 7) -> dict[str, Any]:
@@ -161,17 +180,18 @@ async def test_evolution_creates_updates_and_reloads_markdown_skill(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_skill_match_prechecks_tools_and_parameterized_pattern(tmp_path: Path) -> None:
-    """输入：临时 Skill 文件、参数化触发问题和两组可用工具集合。
+    """输入：临时 Skill 文件、参数化触发问题、两组工具集合与管理禁用状态。
 
-    输出：无；失效工具仍匹配或变量触发模式不生效时由断言报告失败。
-    功能：验证下次提问命中 Skill 前先检查依赖 MCP，缺失时按文档降级为从头推理。
+    输出：无；失效工具、禁用 Skill 仍匹配或变量触发模式不生效时由断言报告失败。
+    功能：验证命中 Skill 前检查依赖和启用状态，缺失或管理禁用时降级为从头推理。
     """
 
     module = _load_skill_evolution()
+    embedder = _FakeEmbedder()
     engine = module.SkillEvolutionEngine(
         _FakeLlm([_extraction(["分析{品类}最近{days}天退单原因"])]),
         tmp_path,
-        _FakeEmbedder(),
+        embedder,
     )
     created = await engine.evaluate_and_evolve(_complex_trace(module))
 
@@ -193,10 +213,65 @@ async def test_skill_match_prechecks_tools_and_parameterized_pattern(tmp_path: P
         turn_id="turn-2",
         user_message="请分析最近30天电视退单原因",
     )
+    created.enabled = False
+    engine._write_skill_file(created)
+    disabled = hooks.pre_llm_call(
+        session_id="session-3",
+        turn_id="turn-3",
+        user_message="请分析最近30天电视退单原因",
+    )
 
     assert injected is not None
     assert "退单原因分析" in injected["context"]
     assert unavailable is None
+    assert disabled is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_router_routes_high_confidence_skill_and_falls_back(tmp_path: Path) -> None:
+    """输入：已沉淀的退单 Skill、确定性 Embedding 和一条无关问题。
+
+    输出：无；高相似问题注入工作流，无关问题返回 ``None`` 交给 LLM 规划。
+    功能：验证触发语句重心在满足 0.85 阈值时直达 Skill，低置信度不会错误路由。
+    """
+
+    module = _load_skill_evolution()
+    embedder = _FakeEmbedder()
+    engine = module.SkillEvolutionEngine(
+        _FakeLlm([_extraction(["分析{品类}最近{days}天退单原因"])]),
+        tmp_path,
+        embedder,
+    )
+    created = await engine.evaluate_and_evolve(_complex_trace(module))
+    assert created is not None
+    created.trigger_patterns.extend(
+        [
+            "请分析最近30天电视退单原因",
+            "帮我看看最近的情况",
+        ]
+    )
+    engine._write_skill_file(created)
+    hooks = module.SkillEvolutionHooks(
+        engine,
+        {"query_return_stats_nl2sql", "query_aftersale_nl2sql"},
+    )
+
+    routed = hooks.pre_llm_call(
+        session_id="session-1",
+        turn_id="turn-1",
+        user_message="请分析最近30天电视退单原因 @Hermes_agent",
+    )
+    fallback = hooks.pre_llm_call(
+        session_id="session-2",
+        turn_id="turn-2",
+        user_message="帮我看看最近的情况",
+    )
+
+    assert routed is not None
+    assert "语义路由" in routed["context"]
+    assert "置信度 1.00" in routed["context"]
+    assert fallback is None
+    assert embedder.batch_calls == 1
 
 
 @pytest.mark.asyncio

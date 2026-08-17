@@ -17,6 +17,12 @@ from .knowledge_rag import (
     format_knowledge_context,
     should_search_knowledge,
 )
+from .knowledge_graph import (
+    AftersaleKnowledgeGraph,
+    GraphQueryResult,
+    QueryRouter,
+    format_graph_context,
+)
 from .long_memory_extractor import ALLOWED_MEMORY_TOPICS, MemoryExtractor
 from .long_memory_models import (
     MemoryExtraction,
@@ -49,6 +55,7 @@ from .whitelist import BusinessWhitelist, DatabaseWhitelistLoader
 __all__ = [
     "ALLOWED_TOPICS",
     "ALLOWED_MEMORY_TOPICS",
+    "AftersaleKnowledgeGraph",
     "BusinessWhitelist",
     "CONTEXT_TTL_SECONDS",
     "ContextManager",
@@ -58,6 +65,7 @@ __all__ = [
     "DatabaseWhitelistLoader",
     "DashScopeEmbeddingClient",
     "DocType",
+    "GraphQueryResult",
     "KnowledgeChunk",
     "KnowledgeMilvusStore",
     "KnowledgeRAG",
@@ -69,6 +77,7 @@ __all__ = [
     "MemoryRecord",
     "MilvusVectorStore",
     "RetrievalResult",
+    "QueryRouter",
     "SQLiteMemoryStore",
     "SlotExtraction",
     "SlotExtractor",
@@ -79,6 +88,7 @@ __all__ = [
     "canonical_json",
     "create_model",
     "extract_entities",
+    "format_graph_context",
     "format_knowledge_context",
     "invoke_model_text",
     "normalize_memory_topic",

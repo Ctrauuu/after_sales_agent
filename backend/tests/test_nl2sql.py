@@ -601,7 +601,7 @@ def test_dynamic_aftersale_tools_use_shared_pipeline() -> None:
     输出：无；断言失败时由 pytest 报告测试失败。
     功能：确认所有售后动态分析工具引用统一创建的 Pipeline 实例。
     """
-    from mcp_suning import aftersale_server
+    from mcp_suning.servers import aftersale as aftersale_server
     from nl2sql.runtime import nl2sql_pipeline
 
     assert aftersale_server.nl2sql_pipeline is nl2sql_pipeline
@@ -613,9 +613,9 @@ def test_return_stats_nl2sql_authorizes_then_uses_shared_pipeline(
     """输入：pytest ``monkeypatch`` 和固定统计参数。
 
     输出：无；断言失败时由 pytest 报告测试失败。
-    功能：验证退单统计把结构化参数转成受控问题并交给共用 Pipeline。
+    功能：验证退单统计把结构化参数转成受控问题并交给 Lite Pipeline。
     """
-    from mcp_suning import aftersale_server
+    from mcp_suning.servers import aftersale as aftersale_server
 
     events: list[str] = []
     safe_filters = {
@@ -670,7 +670,7 @@ def test_return_stats_nl2sql_authorizes_then_uses_shared_pipeline(
     )
     monkeypatch.setattr(
         aftersale_server,
-        "nl2sql_pipeline",
+        "nl2sql_lite_pipeline",
         FakePipeline(),
     )
 
@@ -694,7 +694,7 @@ def test_aftersale_nl2sql_tool_authorizes_before_pipeline(
     功能：公开 MCP 工具必须把鉴权结果传入 NL2SQL Pipeline。
     """
 
-    from mcp_suning import aftersale_server
+    from mcp_suning.servers import aftersale as aftersale_server
 
     events: list[str] = []
     safe_filters = {

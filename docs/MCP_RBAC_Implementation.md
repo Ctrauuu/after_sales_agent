@@ -29,13 +29,15 @@ IM 发送者
 └── bridge.py         # 读取 Hermes 身份、签名并调用 MCP
 
 backend/mcp_suning/
-├── auth_attestation.py  # 验签与防重放
-├── auth_middleware.py   # 用户映射、授权范围、脱敏
-├── order_server.py
-├── aftersale_server.py
-├── product_server.py
-├── logistics_server.py
-└── payment_server.py
+├── security/
+│   ├── attestation.py   # 验签与防重放
+│   └── rbac.py          # 用户映射、授权范围、脱敏
+└── servers/
+    ├── order.py
+    ├── aftersale.py
+    ├── product.py
+    ├── logistics.py
+    └── payment.py
 ```
 
 ## 为什么需要插件桥接

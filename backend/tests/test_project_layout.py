@@ -71,12 +71,11 @@ def test_backend_runtime_files_are_colocated() -> None:
         / "SKILL.md"
     ).is_file()
     assert (BACKEND_ROOT / "infra" / "milvus" / "compose.yaml").is_file()
-    for filename in (
-        "order_timeline.py",
-        "timeline_client.py",
-        "order_timeline_server.py",
-    ):
-        assert (BACKEND_ROOT / "mcp_suning" / filename).is_file()
+    assert (BACKEND_ROOT / "mcp_suning" / "security" / "attestation.py").is_file()
+    assert (BACKEND_ROOT / "mcp_suning" / "security" / "rbac.py").is_file()
+    assert (BACKEND_ROOT / "mcp_suning" / "timeline" / "tracker.py").is_file()
+    assert (BACKEND_ROOT / "mcp_suning" / "timeline" / "gateway.py").is_file()
+    assert (BACKEND_ROOT / "mcp_suning" / "servers" / "timeline.py").is_file()
     assert (
         BACKEND_ROOT
         / "infra"

@@ -9,7 +9,7 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from mcp_suning.auth_attestation import (
+from mcp_suning.security.attestation import (
     AuthenticatedPrincipal,
     mint_delegated_attestation,
 )

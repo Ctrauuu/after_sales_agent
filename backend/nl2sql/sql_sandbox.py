@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping
 
-from mcp_suning.auth_middleware import build_scope_clause
+from mcp_suning.security.rbac import build_scope_clause
 from nl2sql.schema_registry import SCHEMA_REGISTRY
 
 

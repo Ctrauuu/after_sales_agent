@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import pytest
 from fastmcp import Client, Context, FastMCP
 
-import mcp_suning.auth_middleware as auth
-from mcp_suning.auth_attestation import AuthenticatedPrincipal
-from mcp_suning.auth_middleware import (
+import mcp_suning.security.rbac as auth
+from mcp_suning.security.attestation import AuthenticatedPrincipal
+from mcp_suning.security.rbac import (
     DataScope,
     PermissionInterceptor,
     PermissionPolicy,

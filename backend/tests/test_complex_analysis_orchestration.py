@@ -87,11 +87,12 @@ class _FakeLlm:
     def __init__(self) -> None:
         """输入：无。
 
-        输出：初始化普通完成调用用途记录。
-        功能：区分规划与聚合请求，验证规划器不再调用不兼容的结构化响应格式。
+        输出：初始化普通完成调用用途和消息记录。
+        功能：区分规划与聚合请求，并保留 prompt/evidence 供降级语义断言。
         """
 
         self.purposes: list[str] = []
+        self.messages: list[tuple[str, list[dict[str, Any]]]] = []
 
     async def acomplete(self, _messages: list[dict[str, Any]], **kwargs: Any) -> SimpleNamespace:
         """输入：规划或聚合消息 ``_messages`` 及调用参数 ``kwargs``。
@@ -102,6 +103,7 @@ class _FakeLlm:
 
         purpose = str(kwargs.get("purpose", ""))
         self.purposes.append(purpose)
+        self.messages.append((purpose, _messages))
         if purpose == "suning_aftersale_dag_planning":
             return SimpleNamespace(
                 text=json.dumps(
@@ -131,6 +133,14 @@ class _FakeLlm:
                 )
             )
 
+        evidence = str(_messages[-1].get("content", ""))
+        if "degrade_level=L2_CORE" in evidence:
+            return SimpleNamespace(
+                text=(
+                    "退单趋势维度暂不可用：核心数据 query_return_stats_nl2sql 暂不可用；"
+                    "当前报告不完整，请稍后重试该部分。"
+                )
+            )
         return SimpleNamespace(text="聚合报告：数据均来自子任务查询。")
 
 
@@ -186,6 +196,28 @@ class _FakeLifecycle:
             terminal_state=_SubagentState.SUCCEEDED,
             summary=f"任务 {handle} 的真实查询摘要",
         )
+
+
+class _L2DegradedLifecycle(_FakeLifecycle):
+    """首个子任务成功但摘要包含 L2 降级信封语义的生命周期替身。"""
+
+    def result(self, handle: int) -> SimpleNamespace:
+        """输入：已完成子任务句柄 ``handle``。
+
+        输出：首个任务返回 L2 notice，后续任务返回普通成功摘要。
+        功能：模拟 Tool 降级但 Hermes 子 Agent 生命周期仍为 SUCCEEDED 的 T19 场景。
+        """
+
+        if handle == 0:
+            return SimpleNamespace(
+                terminal_state=_SubagentState.SUCCEEDED,
+                summary=(
+                    "available=false tool_name=query_return_stats_nl2sql "
+                    "degrade_level=L2_CORE notice=核心数据「query_return_stats_nl2sql」"
+                    "暂不可用；当前结果不完整，请稍后重试该部分。"
+                ),
+            )
+        return super().result(handle)
 
 
 def test_parse_dag_rejects_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -244,6 +276,54 @@ async def test_orchestrator_executes_dependency_layers_and_aggregates(
         "suning_aftersale_dag_aggregation",
     ]
     assert report == "聚合报告：数据均来自子任务查询。"
+
+
+@pytest.mark.asyncio
+async def test_t19_l2_degrade_notice_survives_summary_dependency_and_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：首个子 Agent 成功返回 L2 降级摘要，第二个任务依赖该摘要。
+
+    输出：无；状态被改为失败、notice/字段丢失或聚合误写为空结果时断言失败。
+    功能：覆盖 T19，锁定子 Agent summary、依赖 context 和最终报告的降级语义。
+    """
+
+    orchestration = _load_orchestration(monkeypatch)
+    lifecycle = _L2DegradedLifecycle()
+    llm = _FakeLlm()
+    coordinator = orchestration.TaskOrchestrator(llm, lifecycle)
+    dag = orchestration.TaskDAG(
+        "分析退单趋势和原因",
+        [
+            orchestration.SubTask("trend", "trend_analysis", "统计退单趋势"),
+            orchestration.SubTask(
+                "reason",
+                "reason_drilldown",
+                "根据趋势下钻原因",
+                ["trend"],
+            ),
+        ],
+    )
+
+    await coordinator.run(dag, 30)
+    report = await coordinator.aggregate(dag)
+
+    degraded_summary = dag.sub_tasks[0].summary or ""
+    assert all(task.status is orchestration.TaskStatus.SUCCESS for task in dag.sub_tasks)
+    assert "available=false" in degraded_summary
+    assert "tool_name=query_return_stats_nl2sql" in degraded_summary
+    assert "degrade_level=L2_CORE" in degraded_summary
+    assert "当前结果不完整" in degraded_summary
+    assert degraded_summary in lifecycle.requests[1].goal
+    assert "不得改写为‘没有数据’或‘查询结果为空’" in lifecycle.requests[0].goal
+
+    _, aggregate_messages = llm.messages[-1]
+    assert "L2_CORE" in aggregate_messages[1]["content"]
+    assert "当前报告不完整" in aggregate_messages[0]["content"]
+    assert "暂不可用" in report
+    assert "当前报告不完整" in report
+    assert "查询结果为空" not in report
+    assert degraded_summary in coordinator._fallback_report(dag)
 
 
 @pytest.mark.asyncio

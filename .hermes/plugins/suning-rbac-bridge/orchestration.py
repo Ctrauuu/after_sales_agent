@@ -266,7 +266,10 @@ def _task_context(task: SubTask, dag: TaskDAG, date_range_days: int) -> str:
         f"时间窗口：最近 {date_range_days} 天。\n"
         f"本节点目标：{task.description}\n"
         f"前置任务压缩摘要：\n{dependencies}\n"
-        "只使用已授权的苏宁业务工具查询事实；没有返回数据时明确写‘未返回数据’，绝不编造。"
+        "只使用已授权的苏宁业务工具查询事实；查询成功但为空时明确写‘查询结果为空’，绝不编造。"
+        "工具返回 status=degraded 或 available=false 时，摘要必须原样保留 tool_name、degrade_level、"
+        "available=false 和 notice；不得改写为‘没有数据’或‘查询结果为空’。"
+        "L1 降级可继续其他分析；L2 降级必须明确写‘核心数据暂不可用、当前结果不完整’。"
         "除 chart_gen 只能使用前置摘要外，每个节点最多调用一次最匹配的查询工具，首次结果不足时直接说明局限。"
         "不要调用 send_aftersale_chart 或任何消息发送工具。"
         "最终仅返回不超过 800 字的中文摘要，包含数据依据、结论和局限。"
@@ -449,7 +452,9 @@ class TaskOrchestrator:
                     "你是售后分析报告聚合器。只依据提供的子任务摘要写中文报告，"
                     "不得补充任何未出现的数据。先给关键发现，再给可执行建议；"
                     "失败或超时节点必须明确标为‘暂不可用’。如果有 chart_gen，"
-                    "只列出建议图表，不能声称图片已经发送。"
+                    "只列出建议图表，不能声称图片已经发送。证据含 available=false 时必须保留"
+                    "tool_name、degrade_level 和 notice；L2_CORE 对应维度必须写‘暂不可用’和"
+                    "‘当前报告不完整’，不得改写为‘查询结果为空’。"
                 ),
             },
             {"role": "user", "content": f"用户问题：{dag.root_task}\n子任务证据：\n{evidence}"},
