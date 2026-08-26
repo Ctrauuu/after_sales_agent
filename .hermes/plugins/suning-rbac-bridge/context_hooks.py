@@ -49,6 +49,23 @@ def build_conversation_runtime(
 
     输出：短期上下文 Hooks、同一 Redis 客户端和同一 MySQL Engine。
     功能：一次装配会话槽位与身份路由基础设施，未注入 Client 时才创建 Redis 连接池。
+             build_conversation_runtime()
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+          ▼                ▼                ▼
+       Redis             MySQL             LLM
+          │                │                │
+          ▼                ▼                │
+ ContextManager   DatabaseWhitelistLoader   │
+          │                │                │
+          │                └──────┐         │
+          │                       ▼         │
+          │                  SlotExtractor ◄┘
+          │                       │
+          └──────────┐    ┌───────┘
+                     ▼    ▼
+               ConversationHooks
     """
 
     resolved_redis_client = (

@@ -145,6 +145,11 @@ def configured_attestation(monkeypatch: pytest.MonkeyPatch) -> None:
         "suning_authn_require_redis",
         False,
     )
+    monkeypatch.setattr(
+        attestation.settings,
+        "suning_cron_service_subject",
+        "precompute-daily",
+    )
 
 
 def test_valid_attestation_returns_verified_principal() -> None:
@@ -162,6 +167,53 @@ def test_valid_attestation_returns_verified_principal() -> None:
     assert principal.external_subject == "ou_real_sender"
     assert principal.chat_type == "dm"
     assert principal.identity_issuer == TEST_ISSUER
+
+
+def test_cron_attestation_requires_the_configured_service_subject() -> None:
+    """输入：Cron 平台的正确与错误服务主体凭证。
+
+    输出：无；主体映射或拒绝边界错误时由 pytest 报告失败。
+    功能：验证 Cron 只能使用配置中的固定服务主体，且强制归一为私聊会话。
+    """
+
+    principal = attestation.verify_attestation(
+        _context(_token(platform="cron", sub="precompute-daily", chat_type="dm")),
+        expected_tool="search_orders",
+    )
+
+    assert principal.platform == "cron"
+    assert principal.external_subject == "precompute-daily"
+    with pytest.raises(PermissionError, match="Cron 服务主体无效"):
+        attestation.verify_attestation(
+            _context(_token(platform="cron", sub="someone-else", jti="cron-invalid")),
+            expected_tool="search_orders",
+        )
+
+
+def test_bridge_mints_cron_identity_only_for_scheduler_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：Hermes Cron 标记、服务主体配置和真实 Bridge 模块。
+
+    输出：无；Cron 身份未固定或普通会话可伪造时由 pytest 报告失败。
+    功能：验证 Bridge 只在调度器进程标记存在时签发固定 ``cron`` 服务身份。
+    """
+
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setenv("SUNING_CRON_SERVICE_SUBJECT", "precompute-daily")
+    bridge = _load_real_bridge(monkeypatch)
+    monkeypatch.setattr(
+        bridge,
+        "get_session_env",
+        lambda name, default="": "cron_test_20260823" if name == "HERMES_SESSION_ID" else default,
+    )
+
+    assert bridge.current_identity() == {
+        "platform": "cron",
+        "external_subject": "precompute-daily",
+        "chat_type": "dm",
+        "message_id": "",
+    }
 
 
 def test_delegated_attestation_preserves_subject_and_rebinds_tool() -> None:

@@ -32,3 +32,16 @@ uv run pytest
 
 `tests/test_function_documentation.py` 会阻止缺少 `输入`、`输出` 或 `功能` 的
 Python 函数进入项目。
+
+## Code simplicity
+
+Prefer simple, explicit implementations.
+
+- Do not introduce abstraction unless it removes real duplication.
+- Prefer functions over classes when no persistent state is required.
+- Avoid unnecessary Factory / Manager / Handler / Registry patterns.
+- Avoid wrappers that only forward parameters.
+- Keep call chains short.
+- Prefer existing project structure over new generic frameworks.
+- Do not create "future-proof" abstractions without a current requirement.
+- Keep business logic easy to trace from entry point to data access.

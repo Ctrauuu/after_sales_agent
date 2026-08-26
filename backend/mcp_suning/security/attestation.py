@@ -25,6 +25,7 @@ MAX_TOKEN_LIFETIME_SECONDS = 60
 CLOCK_SKEW_SECONDS = 5
 MIN_SECRET_BYTES = 32
 TRUSTED_PLATFORMS = {"feishu", "wecom", "dingtalk"}
+CRON_PLATFORM = "cron"
 DIRECT_CHAT_TYPES = {"dm", "direct", "private", "p2p"}
 GROUP_CHAT_TYPES = {"group", "channel", "forum", "thread"}
 
@@ -250,11 +251,18 @@ def verify_attestation(
     message_id = str(claims.get("message_id") or "").strip()
     jti = str(claims.get("jti") or "").strip()
 
-    if platform not in TRUSTED_PLATFORMS:
-        raise PermissionError("身份凭证平台无效")
     if not subject or len(subject) > 128:
         raise PermissionError("外部用户身份无效")
-    if raw_chat_type in DIRECT_CHAT_TYPES:
+    if platform == CRON_PLATFORM:
+        expected_subject = settings.suning_cron_service_subject.strip()
+        if not expected_subject or subject != expected_subject:
+            raise PermissionError("Cron 服务主体无效")
+        if raw_chat_type != "dm":
+            raise PermissionError("Cron 服务主体必须使用私聊会话")
+        chat_type = "dm"
+    elif platform not in TRUSTED_PLATFORMS:
+        raise PermissionError("身份凭证平台无效")
+    elif raw_chat_type in DIRECT_CHAT_TYPES:
         chat_type = "dm"
     elif raw_chat_type in GROUP_CHAT_TYPES:
         chat_type = raw_chat_type

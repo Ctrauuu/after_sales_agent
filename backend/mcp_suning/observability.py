@@ -105,18 +105,23 @@ def finish_trace(scope: TraceScope, *, success: bool) -> None:
     context.detach(scope.parent_token)
 
 
-def start_mcp_span(tool_name: str, server: str) -> tuple[Any, float]:
+def start_mcp_span(tool_name: str, server: str) -> tuple[Any, float, Any]:
     """输入：下游工具名 ``tool_name`` 与服务地址 ``server``。
 
-    输出：OpenTelemetry Span 和单调时钟开始时间元组。
-    功能：为订单聚合器发起的每个并行私有 MCP 调用记录同一 Trace 下的独立耗时区间。
+    输出：OpenTelemetry Span、单调时钟开始时间和上下文恢复令牌。
+    功能：为每个并行私有 MCP 调用记录独立区间，并使跨进程 metadata 指向该调用 Span。
     """
 
     span = trace.get_tracer("suning.hermes").start_span(
         f"mcp.{tool_name}",
-        attributes={"suning.trace_id": current_trace_id.get(), "server": server},
+        attributes={
+            "suning.trace_id": current_trace_id.get(),
+            "tool_name": tool_name,
+            "server": server,
+        },
     )
-    return span, time.perf_counter()
+    span_token = context.attach(trace.set_span_in_context(span))
+    return span, time.perf_counter(), span_token
 
 
 def inject_trace_metadata(metadata: dict[str, Any]) -> None:
@@ -132,15 +137,16 @@ def inject_trace_metadata(metadata: dict[str, Any]) -> None:
 def end_mcp_span(
     span: Any,
     started_at: float,
+    span_token: Any,
     *,
     rows_returned: int,
     success: bool,
     error: str = "",
 ) -> None:
-    """输入：下游 Span、开始时间、返回行数、成功状态和可选错误信息。
+    """输入：下游 Span、开始时间、上下文令牌、返回行数、成功状态和可选错误信息。
 
-    输出：无；写入属性并结束该私有 MCP Span。
-    功能：使并行订单、售后、物流和支付请求分别暴露耗时、行数和失败原因，便于定位慢源或静默降级。
+    输出：无；写入属性、结束私有 MCP Span 并恢复调用前上下文。
+    功能：暴露下游耗时、行数和失败原因，并防止已结束的调用 Span 泄漏到后续操作。
     """
 
     attributes = {
@@ -149,10 +155,13 @@ def end_mcp_span(
         "success": success,
         "error_message": error,
     }
-    span.set_attributes(attributes)
-    if not success:
-        span.set_status(trace.Status(trace.StatusCode.ERROR))
-    span.end()
+    try:
+        span.set_attributes(attributes)
+        if not success:
+            span.set_status(trace.Status(trace.StatusCode.ERROR))
+        span.end()
+    finally:
+        context.detach(span_token)
 
 
 def result_rows(payload: Any) -> int:

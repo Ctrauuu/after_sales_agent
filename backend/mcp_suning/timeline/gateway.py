@@ -89,7 +89,10 @@ class PrivateMCPCaller:
         """
 
         attestation = mint_delegated_attestation(principal, tool_name=tool_name)
-        span, started_at = start_mcp_span(tool_name, endpoint)
+        span, started_at, span_token = start_mcp_span(tool_name, endpoint)
+        success = False
+        rows_returned = 0
+        error = ""
         try:
             async with streamable_http_client(endpoint) as (read, write, _session_id):
                 async with ClientSession(read, write) as session:
@@ -101,24 +104,28 @@ class PrivateMCPCaller:
                         arguments=arguments,
                         meta=metadata,
                     )
+            if bool(getattr(result, "isError", False)):
+                raise DownstreamMCPError(_result_text(result) or "下游 MCP 拒绝调用")
+            payload = _result_payload(result)
+            success = True
+            rows_returned = result_rows(payload)
+            return payload
         except DownstreamMCPError as exc:
-            end_mcp_span(span, started_at, rows_returned=0, success=False, error=str(exc))
+            error = str(exc)
             raise
         except Exception as exc:
-            error = DownstreamMCPError(f"MCP 请求失败: {exc}")
-            end_mcp_span(span, started_at, rows_returned=0, success=False, error=str(error))
-            raise error from exc
-        if bool(getattr(result, "isError", False)):
-            error = DownstreamMCPError(_result_text(result) or "下游 MCP 拒绝调用")
-            end_mcp_span(span, started_at, rows_returned=0, success=False, error=str(error))
-            raise error
-        try:
-            payload = _result_payload(result)
-        except DownstreamMCPError as exc:
-            end_mcp_span(span, started_at, rows_returned=0, success=False, error=str(exc))
-            raise
-        end_mcp_span(span, started_at, rows_returned=result_rows(payload), success=True)
-        return payload
+            mcp_error = DownstreamMCPError(f"MCP 请求失败: {exc}")
+            error = str(mcp_error)
+            raise mcp_error from exc
+        finally:
+            end_mcp_span(
+                span,
+                started_at,
+                span_token,
+                rows_returned=rows_returned,
+                success=success,
+                error=error,
+            )
 
 
 class TimelineMCPGateway:

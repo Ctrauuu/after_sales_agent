@@ -1,9 +1,14 @@
-"""售后 MCP：提供退单聚合统计和售后流程明细两个只读工具。"""
+"""售后 MCP：提供退单聚合、SKU 退单率和售后流程四类只读工具。"""
+
+import hashlib
+import json
 
 from typing import Any
 
 import sqlalchemy as sa
 from fastmcp import Context, FastMCP
+from redis import Redis
+from redis.exceptions import RedisError
 
 # 两个动态分析 Tool 共用 runtime 中的 Pipeline；修改 nl2sql 后需重载本服务。
 from nl2sql.runtime import nl2sql_lite_pipeline, nl2sql_pipeline
@@ -12,10 +17,105 @@ from mcp_suning.security.rbac import (
     build_scope_clause,
     interceptor,
 )
+from mcp_suning.config import settings
 from mcp_suning.database import engine
 
 
 mcp = FastMCP("mcp-aftersale")
+CRON_SERVICE_USER_ID = "U-SVC-CRON"
+PRECOMPUTED_RETURN_STATS_TTL_SECONDS = 60 * 60
+HOT_RETURN_STATS = frozenset({("category", 1, ""), ("day", 7, "")})
+
+
+def _is_hot_return_stats(
+    group_by: str,
+    safe_filters: dict[str, Any],
+) -> bool:
+    """输入：规范化聚合维度 ``group_by`` 与经过 RBAC 收窄的 ``safe_filters``。
+
+    输出：参数属于凌晨预热的固定高频退单统计时返回 ``True``。
+    功能：限制 Cron 只写入已定义的热点查询，避免任意内部查询占用预计算缓存。
+    """
+
+    return (
+        group_by,
+        int(safe_filters["date_range_days"]),
+        str(safe_filters.get("category") or "").strip(),
+    ) in HOT_RETURN_STATS
+
+
+def _precomputed_return_stats_key(
+    group_by: str,
+    safe_filters: dict[str, Any],
+) -> str:
+    """输入：规范化聚合维度 ``group_by`` 与完整 ``safe_filters``。
+
+    输出：稳定、不可反解业务条件的 Redis 缓存键。
+    功能：把请求参数和最终行级权限范围共同纳入键，杜绝跨数据范围复用预计算结果。
+    """
+
+    payload = json.dumps(
+        {"group_by": group_by, "safe_filters": safe_filters},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"suning:precomputed:return-stats:{digest}"
+
+
+def _load_precomputed_return_stats(
+    group_by: str,
+    safe_filters: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """输入：规范化聚合维度 ``group_by`` 与经过授权的 ``safe_filters``。
+
+    输出：有效预计算统计列表；不存在、损坏或缓存不可用时返回 ``None``。
+    功能：在不影响在线查询可用性的前提下读取仅对同一权限范围可见的热点结果。
+    """
+
+    if not settings.redis_url or not _is_hot_return_stats(group_by, safe_filters):
+        return None
+    try:
+        cached = Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=0.5,
+            socket_timeout=0.5,
+        ).get(_precomputed_return_stats_key(group_by, safe_filters))
+        result = json.loads(cached) if cached else None
+    except (RedisError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return result if isinstance(result, list) else None
+
+
+def _store_precomputed_return_stats(
+    group_by: str,
+    safe_filters: dict[str, Any],
+    result: list[dict[str, Any]],
+) -> None:
+    """输入：规范化聚合维度、授权范围和已脱敏的统计 ``result``。
+
+    输出：无；Redis 不可用或写入失败时静默保留在线查询结果。
+    功能：仅由已授权 Cron 主体写入一小时热点缓存，不让缓存故障阻断凌晨预热。
+    """
+
+    if not settings.redis_url or not _is_hot_return_stats(group_by, safe_filters):
+        return
+    try:
+        Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=0.5,
+            socket_timeout=0.5,
+        ).setex(
+            _precomputed_return_stats_key(group_by, safe_filters),
+            PRECOMPUTED_RETURN_STATS_TTL_SECONDS,
+            json.dumps(result, ensure_ascii=False, default=str),
+        )
+    except RedisError:
+        return
 
 
 def _return_selector(
@@ -55,7 +155,7 @@ def query_return_stats_nl2sql(
     功能：把结构化统计参数转换为受控问题，并交给共用 NL2SQL Pipeline 查询。
     """
 
-    _, safe_filters = authorize_mcp_request(
+    user, safe_filters = authorize_mcp_request(
         ctx,
         "query_return_stats_nl2sql",
         {"date_range_days": date_range_days, "category": category},
@@ -85,6 +185,10 @@ def query_return_stats_nl2sql(
     if group_key not in dimensions:
         raise ValueError("group_by 必须是 day、category、reason、region 或 brand")
 
+    cached = _load_precomputed_return_stats(group_key, safe_filters)
+    if cached is not None:
+        return cached
+
     question = (
         f"统计最近 {safe_filters['date_range_days']} 天的退单数据，"
         f"{dimensions[group_key]}。"
@@ -99,8 +203,93 @@ def query_return_stats_nl2sql(
         question += f"只统计品类 {requested_category} 及其子品类。"
 
     result = nl2sql_lite_pipeline.run(question, safe_filters)
-    return interceptor.mask_sensitive_data(
+    masked = interceptor.mask_sensitive_data(
         result["rows"],
+        safe_filters["data_scope"],
+    )
+    if getattr(user, "user_id", "") == CRON_SERVICE_USER_ID:
+        _store_precomputed_return_stats(group_key, safe_filters, masked)
+    return masked
+
+
+@mcp.tool(
+    name="query_sku_return_rate",
+    description=(
+        "按订单创建时间统计指定范围内各 SKU 的退单订单率，"
+        "返回退单订单数、订单数和退单率最高的前若干 SKU。"
+    ),
+)
+def query_sku_return_rate(
+    ctx: Context,
+    date_range_days: int = 30,
+    limit: int = 5,
+    category: str = "",
+) -> dict[str, Any]:
+    """输入：FastMCP ``ctx``、订单时间范围、Top N 数量和可选品类 ``category``。
+
+    输出：包含实际查询天数、行数和按 SKU 聚合的退单订单率；参数无效时抛出 ``ValueError``。
+    功能：在服务端鉴权范围内用固定参数化 SQL 计算退单订单数与订单数之比，不调用 NL2SQL。
+    """
+
+    _, safe_filters = authorize_mcp_request(
+        ctx,
+        "query_sku_return_rate",
+        {"date_range_days": date_range_days, "category": category},
+    )
+    if not 1 <= limit <= 100:
+        raise ValueError("limit 必须在 1 到 100 之间")
+
+    scope_sql, params = build_scope_clause(
+        safe_filters,
+        region_column="o.region_code",
+        city_column="o.city_code",
+        category_column="s.category_l3_code",
+    )
+    params.update(
+        date_range_days=safe_filters["date_range_days"],
+        limit=limit,
+    )
+    sql = sa.text(
+        """
+        SELECT
+            i.sku_code,
+            MAX(s.product_name) AS product_name,
+            COUNT(DISTINCT r.order_id) AS returned_order_count,
+            COUNT(DISTINCT i.order_id) AS order_count,
+            CAST(
+                ROUND(
+                    100.0 * COUNT(DISTINCT r.order_id)
+                    / NULLIF(COUNT(DISTINCT i.order_id), 0),
+                    2
+                ) AS DOUBLE
+            ) AS return_rate_pct
+        FROM t_order_item AS i
+        JOIN t_order_main AS o ON o.order_id = i.order_id
+        JOIN t_product_sku AS s ON s.sku_code = i.sku_code
+        LEFT JOIN t_aftersale_return AS r
+            ON r.order_id = i.order_id
+           AND r.sku_code = i.sku_code
+        WHERE o.create_time >= (
+            SELECT MAX(create_time) - (:date_range_days * 86400)
+            FROM t_order_main
+        )
+        """
+        + scope_sql
+        + """
+        GROUP BY i.sku_code
+        ORDER BY return_rate_pct DESC, order_count DESC, i.sku_code ASC
+        LIMIT :limit
+        """
+    )
+    with engine.connect() as connection:
+        rows = [dict(row) for row in connection.execute(sql, params).mappings().all()]
+    return interceptor.mask_sensitive_data(
+        {
+            "success": True,
+            "date_range_days": safe_filters["date_range_days"],
+            "row_count": len(rows),
+            "rows": rows,
+        },
         safe_filters["data_scope"],
     )
 

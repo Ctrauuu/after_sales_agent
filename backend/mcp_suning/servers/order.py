@@ -130,6 +130,23 @@ def get_order_detail(order_id: int, ctx: Context) -> dict[str, Any]:
     """输入：正整数订单 ID ``order_id`` 和 FastMCP 上下文 ``ctx``。
 
     输出：包含订单、全部授权关联退单及状态标签的成功字典，或“不存在或无权访问”的失败字典。
+    {
+    "success": True,
+    "order": {
+        "order_id": "O1001",
+        ...
+    },
+    "returns": [
+        {
+            "return_id": "R01",
+            ...
+        },
+        {
+            "return_id": "R02",
+            ...
+        }
+    ]
+}
     功能：在时间、区域、城市和品类权限内查询单笔订单及其所有退单，为订单详情和全链路按退单聚合提供授权后的基础数据。
     """
 

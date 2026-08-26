@@ -14,8 +14,9 @@ description: 当用户要求分析退单/退货的趋势、主要品类、原因
   "avg_quality_score": 0.0,
   "created_at": "2026-08-16T08:41:22.620073+00:00",
   "description": "当用户要求分析退单/退货的趋势、主要品类、原因和退款金额并给出图表建议时，自动并联查询退单统计与售后退款明细，生成多维分析结论。",
+  "enabled": true,
   "name": "return_refund_multi_dimension_analysis",
-  "output_template": "## 近{date_range_days}天退单分析 ### ① 主要品类构成（退单量 + 退款金额） | 品类 | 退单量 | 退款金额（元） | |---|---:|---:| {category_amount_table} ### ② 按退单原因 {reason_stats_table} ### ③ 按日趋势 {daily_trend_table} ### 结论 1. **原因**：首要原因为 {top_reason}（{top_reason_count} 单，占比 {top_reason_rate}）；相关原因簇合计 {related_reason_count} 单（占比 {related_reason_rate}）。样本量偏小时仅作参考，不建议据此单独启动赔付决策。 2. **趋势**：{peak_date} 为单日峰值（{peak_count} 单），其余日期均值约 {avg_count} 单，若次日明显回落则为一次性脉冲，建议排查该日事件背景（如促销/集中发货/安装高峰）。 3. **品类与金额**：{top_category} 为退单量与金额双第一（{top_category_count} 单 / {top_category_amount} 元）；{top_category_group} 合计 {top_category_group_amount} 元，占退款总额 {top_category_group_rate}，归因指向相关环节。 4. **数据覆盖提示**：实际可按日窗口为 {data_start}~{data_end} 共 {actual_days} 天，其余日期未返回记录时结论仅限定性参考，不宜外推为完整 {date_range_days} 天周期结论。 ### 图表建议 | # | 图表 | 类型 | 数据 | |---|---|---|---| | 1 | 按日退单趋势 | 折线图/柱状图 | {daily_trend_chart_data}，凸显峰值 | | 2 | 品类退单量构成 | 横向条形图/饼图 | {category_chart_data} | | 3 | 退单原因分布 | 饼图/条形图 | {reason_chart_data} | | 4 | 品类退单量 vs 退款金额 | 双轴图/表格 | {category_amount_chart_data} |",
+  "output_template": "## 近{date_range_days}天退单综合分析（实时查询） ### ① 按日趋势 {trend_result} ### ② 按品类构成 {category_result} ### ③ 按退单原因 {reason_result} ### ④ 退款金额 {refund_amount_result} ### 结论 1. 趋势：根据按日趋势识别峰值日与走势形态。 2. 品类：根据品类构成识别主导品类及其占比。 3. 原因：根据原因分布识别首要原因及原因簇，结合品类进行归因。 4. 数据覆盖：注明可见数据窗口，避免外推。 ### 图表建议 根据实时返回数据生成趋势图、饼图、条形图。",
   "required_mcp_tools": [
     "query_return_stats_nl2sql",
     "query_aftersale_nl2sql"
@@ -30,23 +31,38 @@ description: 当用户要求分析退单/退货的趋势、主要品类、原因
     "分析近{date_range_days}天退单趋势、主要品类、原因和退款金额，并给出图表建议",
     "近{date_range_days}天退货退款分析",
     "退单原因/品类/趋势分析",
-    "returns/refunds analysis"
+    "returns/refunds analysis",
+    "请对近{date_range_days}天售后退单进行复杂综合分析",
+    "分析近{date_range_days}天退单趋势、品类分布、主要原因和退款金额",
+    "售后退单多维综合分析并给出图表建议",
+    "请对近30天售后退单进行复杂综合分析：分别分析退单趋势、品类分布、主要原因和退款金额，最后综合汇总并给出图表建议。",
+    "近{date_range_days}天售后退单分析",
+    "售后退单综合分析",
+    "退货退款多维度分析",
+    "退单趋势/品类/原因/金额分析",
+    "多 Agent 分析售后数据",
+    "请对近30天售后退单进行复杂综合分析：分别分析退单趋势、品类分布、主要原因和退款金额，最后综合汇总并给出图表建议。请使用多 Agent 的方式。",
+    "退单原因",
+    "为什么退单",
+    "退货原因分析",
+    "退单原因呢",
+    "分析一下退单原因"
   ],
-  "updated_at": "2026-08-16T08:42:37.070053+00:00",
-  "usage_count": 2,
-  "version": 2,
+  "updated_at": "2026-08-25T21:54:24.387992+08:00",
+  "usage_count": 5,
+  "version": 5,
   "workflow": [
     {
-      "output_key": "reason_stats",
+      "output_key": "trend_result",
       "params": {
         "date_range_days": "{date_range_days}",
-        "group_by": "reason"
+        "group_by": "day"
       },
       "step": 1,
       "tool": "query_return_stats_nl2sql"
     },
     {
-      "output_key": "category_stats",
+      "output_key": "category_result",
       "params": {
         "date_range_days": "{date_range_days}",
         "group_by": "category"
@@ -55,18 +71,18 @@ description: 当用户要求分析退单/退货的趋势、主要品类、原因
       "tool": "query_return_stats_nl2sql"
     },
     {
-      "output_key": "daily_trend",
+      "output_key": "reason_result",
       "params": {
         "date_range_days": "{date_range_days}",
-        "group_by": "day"
+        "group_by": "reason"
       },
       "step": 3,
       "tool": "query_return_stats_nl2sql"
     },
     {
-      "output_key": "category_amount_stats",
+      "output_key": "refund_amount_result",
       "params": {
-        "question": "近{date_range_days}天退单按品类统计退单数量和退款总金额"
+        "question": "近{date_range_days}天退单的退款总金额是多少"
       },
       "step": 4,
       "tool": "query_aftersale_nl2sql"

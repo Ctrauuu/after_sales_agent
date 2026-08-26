@@ -1,5 +1,5 @@
 name: suning-rbac-bridge
-version: "0.8.0"
+version: "0.9.0"
 description: "苏宁业务 MCP 的可信身份桥接插件；统一三平台身份和私聊会话，并通过 Hooks 注入上下文、长期记忆、知识引用、图表、复杂分析多 Agent 编排及 Skill 自进化。"
 author: "Suning"
 kind: standalone
@@ -11,6 +11,7 @@ provides_tools:
   - get_order_detail
   - query_return_stats_nl2sql
   - query_aftersale_nl2sql
+  - query_sku_return_rate
   - get_aftersale_workflow
   - get_product_info
   - query_logistics

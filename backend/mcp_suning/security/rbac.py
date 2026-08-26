@@ -31,6 +31,7 @@ import sqlalchemy as sa
 from fastmcp import Context
 
 from mcp_suning.security.attestation import AuthenticatedPrincipal, verify_attestation
+from mcp_suning.config import settings
 from mcp_suning.database import engine
 from mcp_suning.domain_registry import CATEGORY_ALIASES, REGION_ALIASES
 
@@ -63,8 +64,13 @@ class UserContext:
     display_name: str = ""
 
 
-AGGREGATE_TOOLS = {"query_return_stats_nl2sql", "query_aftersale_nl2sql"}
+AGGREGATE_TOOLS = {
+    "query_return_stats_nl2sql",
+    "query_aftersale_nl2sql",
+    "query_sku_return_rate",
+}
 TRUSTED_PLATFORMS = {"feishu", "wecom", "dingtalk"}
+CRON_PLATFORM = "cron"
 GROUP_CHAT_TYPES = {"group", "channel", "forum", "thread"}
 LOCATION_SCOPED_ROLES = {"regional_manager", "cs_supervisor"}
 CATEGORY_SCOPED_ROLES = {"quality_engineer"}
@@ -258,7 +264,11 @@ def resolve_user_context(*, platform: str, platform_user_id: str) -> UserContext
 
     platform = platform.strip().lower()
     platform_user_id = platform_user_id.strip()
-    if platform not in TRUSTED_PLATFORMS:
+    if platform == CRON_PLATFORM:
+        expected_subject = settings.suning_cron_service_subject.strip()
+        if not expected_subject or platform_user_id != expected_subject:
+            raise PermissionError("Cron 服务主体无效")
+    elif platform not in TRUSTED_PLATFORMS:
         raise PermissionError(f"不支持的消息平台: {platform}")
     if not platform_user_id:
         raise PermissionError("平台用户身份为空")

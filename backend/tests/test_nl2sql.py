@@ -1,6 +1,6 @@
 """NL2SQL 生成与安全校验的最小测试。"""
 
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -762,3 +762,80 @@ def test_aftersale_nl2sql_tool_authorizes_before_pipeline(
     ]
     assert result["success"] is True
     assert result["row_count"] == 1
+
+
+def test_sku_return_rate_tool_uses_scoped_fixed_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：pytest ``monkeypatch``、固定授权范围和模拟 SQLAlchemy 结果。
+
+    输出：无；断言固定 SQL 使用订单明细分母、左连接退单和绑定的 RBAC 参数。
+    功能：防止 SKU 退单率退回 NL2SQL 或因 WHERE 过滤退单表而丢失无退单订单。
+    """
+
+    from mcp_suning.servers import aftersale as aftersale_server
+
+    safe_filters = {
+        "date_range_days": 14,
+        "data_scope": "full",
+        "allowed_regions": ["HD"],
+        "allowed_categories": ["C1-AC"],
+    }
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = [
+        {
+            "sku_code": "SKU-AC-GL-15P",
+            "product_name": "格力空调",
+            "returned_order_count": 2,
+            "order_count": 10,
+            "return_rate_pct": 20.0,
+        }
+    ]
+    connection = MagicMock()
+    connection.execute.return_value = result
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = connection
+
+    def fake_authorize(
+        _ctx: object,
+        tool_name: str,
+        filters: Mapping[str, Any],
+    ) -> tuple[None, dict[str, Any]]:
+        """输入：MCP 上下文、工具名和调用参数。
+
+        输出：空用户和固定的授权后筛选条件。
+        功能：验证固定退单率工具使用正确工具身份和可收窄的业务筛选。
+        """
+
+        assert tool_name == "query_sku_return_rate"
+        assert dict(filters) == {"date_range_days": 14, "category": "空调"}
+        return None, dict(safe_filters)
+
+    monkeypatch.setattr(aftersale_server, "authorize_mcp_request", fake_authorize)
+    monkeypatch.setattr(aftersale_server, "engine", engine)
+
+    payload = aftersale_server.query_sku_return_rate(
+        None,  # type: ignore[arg-type]
+        date_range_days=14,
+        limit=5,
+        category="空调",
+    )
+
+    statement, params = connection.execute.call_args.args
+    assert "FROM t_order_item AS i" in statement.text
+    assert "LEFT JOIN t_aftersale_return AS r" in statement.text
+    assert "COUNT(DISTINCT r.order_id)" in statement.text
+    assert "o.region_code IN (:rbac_region_0)" in statement.text
+    assert params == {
+        "rbac_region_0": "HD",
+        "rbac_category_0": "C1-AC",
+        "rbac_category_child_0": "C1-AC-%",
+        "date_range_days": 14,
+        "limit": 5,
+    }
+    assert payload == {
+        "success": True,
+        "date_range_days": 14,
+        "row_count": 1,
+        "rows": result.mappings.return_value.all.return_value,
+    }

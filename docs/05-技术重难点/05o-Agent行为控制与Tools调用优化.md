@@ -26,7 +26,7 @@
 ```mermaid
 flowchart TD
     A[意图路由确定场景] --> B[场景→工具集映射]
-    B --> C["退单分析场景:<br/>{search_orders, query_return_stats_nl2sql, get_product_info}"]
+    B --> C["退单分析场景:<br/>{search_orders, query_return_stats_nl2sql, query_sku_return_rate, get_product_info}"]
     B --> D["订单追踪场景:<br/>{get_order_detail, get_aftersale_workflow, query_logistics}"]
     C --> E[裁剪可用工具列表<br/>只给 LLM 暴露3~5个]
     D --> E
@@ -71,7 +71,7 @@ class ToolWhiteList:
 SCENE_TOOL_MAP = {
     "return_analysis": ToolWhiteList(
         scene="退单分析",
-        tools=["search_orders", "query_return_stats_nl2sql", "get_product_info"],
+        tools=["search_orders", "query_return_stats_nl2sql", "query_sku_return_rate", "get_product_info"],
         max_calls_per_turn=5,
     ),
     "order_trace": ToolWhiteList(
@@ -81,12 +81,12 @@ SCENE_TOOL_MAP = {
     ),
     "quality_analysis": ToolWhiteList(
         scene="质量分析",
-        tools=["search_orders", "query_return_stats_nl2sql", "get_product_info"],
+        tools=["search_orders", "query_return_stats_nl2sql", "query_sku_return_rate", "get_product_info"],
         max_calls_per_turn=6,
     ),
     "general_query": ToolWhiteList(
         scene="通用查询",
-        tools=["search_orders", "query_return_stats_nl2sql", "get_product_info",
+        tools=["search_orders", "query_return_stats_nl2sql", "query_sku_return_rate", "get_product_info",
                "get_order_detail", "get_aftersale_workflow",
                "query_logistics", "get_refund_status"],
         max_calls_per_turn=3,

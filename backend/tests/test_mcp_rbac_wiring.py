@@ -27,6 +27,7 @@ DATABASE_TOOL_NAMES = {
         "get_aftersale_workflow",
         "query_aftersale_nl2sql",
         "query_return_stats_nl2sql",
+        "query_sku_return_rate",
     },
     "product.py": {"get_product_info"},
     "logistics.py": {"query_logistics"},
@@ -325,6 +326,7 @@ def test_hermes_bridge_tool_names_match_mcp_servers(
         "get_order_detail": ("mcp-order", "L2_CORE", True, False),
         "query_return_stats_nl2sql": ("mcp-aftersale", "L2_CORE", True, True),
         "query_aftersale_nl2sql": ("mcp-aftersale", "L2_CORE", True, True),
+        "query_sku_return_rate": ("mcp-aftersale", "L2_CORE", True, True),
         "get_aftersale_workflow": (
             "mcp-aftersale",
             "L1_NON_CRITICAL",

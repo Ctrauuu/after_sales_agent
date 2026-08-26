@@ -24,7 +24,8 @@ from .mcp_resilience import (
     MCPCallManager,
     MCPCallResult,
 )
-from .observability import _result_rows, observability
+from . import observability
+from .observability import result_rows
 from .schemas import TOOL_SPECS
 from .tool_governor import ToolGovernor
 
@@ -36,6 +37,8 @@ TOKEN_ISSUER = "suning-rbac-bridge"
 TOKEN_TTL_SECONDS = 30
 MIN_SECRET_BYTES = 32
 TRUSTED_PLATFORMS = {"feishu", "wecom", "dingtalk"}
+CRON_PLATFORM = "cron"
+CRON_SERVICE_SUBJECT_ENV = "SUNING_CRON_SERVICE_SUBJECT"
 DIRECT_CHAT_TYPES = {"dm", "direct", "private", "p2p"}
 GROUP_CHAT_TYPES = {"group", "channel", "forum", "thread"}
 
@@ -93,11 +96,22 @@ def _attestation_configuration() -> tuple[bytes, str]:
 
 
 def current_identity() -> dict[str, str]:
-    """输入：无；隐式读取 Hermes 当前请求的 ContextVar。
+    """输入：无；隐式读取 Hermes 当前请求 ContextVar、Cron 标记和服务主体环境变量。
 
     输出：包含平台、外部用户、会话类型和消息 ID 的可信身份字典。
     功能：从 Hermes 请求上下文取得真实发送者并规范化会话类型，不接受工具参数。
     """
+
+    if (
+        os.getenv("HERMES_CRON_SESSION", "").strip() == "1"
+        and get_session_env("HERMES_SESSION_ID", "").strip().startswith("cron_")
+    ):
+        return {
+            "platform": CRON_PLATFORM,
+            "external_subject": _required_env(CRON_SERVICE_SUBJECT_ENV),
+            "chat_type": "dm",
+            "message_id": "",
+        }
 
     identity = {
         "platform": get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower(),
@@ -107,6 +121,8 @@ def current_identity() -> dict[str, str]:
     }
     if not identity["platform"] or not identity["external_subject"]:
         raise PermissionError("当前请求没有可信的 Hermes 会话身份")
+    if identity["platform"] == CRON_PLATFORM:
+        raise PermissionError("cron 身份仅允许 Hermes 调度器使用")
     if identity["platform"] not in TRUSTED_PLATFORMS:
         raise PermissionError(f"不支持的消息平台: {identity['platform']}")
     if len(identity["external_subject"]) > 128:
@@ -337,7 +353,7 @@ async def invoke_business_tool(
         success = call_result.success
         error = call_result.error_message
         if call_result.success:
-            rows_returned = _result_rows(call_result.data)
+            rows_returned = result_rows(call_result.data)
         elif call_result.error_message:
             logger.warning(
                 "调用苏宁 MCP 最终失败: tool=%s endpoint=%s failure_type=%s error=%s",

@@ -555,6 +555,7 @@ def test_plugin_keeps_rbac_tools_when_context_env_is_missing(
         "get_order_detail",
         "query_return_stats_nl2sql",
         "query_aftersale_nl2sql",
+        "query_sku_return_rate",
         "get_aftersale_workflow",
         "get_product_info",
         "query_logistics",

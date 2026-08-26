@@ -18,13 +18,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 
 logger = logging.getLogger(__name__)
 EVOLUTION_COMPLEXITY_THRESHOLD = 0.4
 SIMILARITY_THRESHOLD = 0.8
 MAX_TRACKED_TURNS = 1024
 _JSON_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
-_TRIGGER_TERMS = ("退单", "退货", "原因", "趋势", "品类", "售后", "统计")
 
 
 @dataclass
@@ -68,19 +69,20 @@ class RouteResult:
 
 
 @dataclass
-class _SemanticRoute:
+class SkillRoute:
     """已注册 Skill 的归一化重心向量及命中统计。"""
 
-    skill: SkillDefinition
-    centroid: list[float]
-    patterns: tuple[str, ...]
-    vectors: list[list[float]]
+    skill_id: str
+    skill_name: str
+    trigger_patterns: tuple[str, ...]
+    centroid_vector: np.ndarray
+    skill: SkillDefinition | None = None
     hit_count: int = 0
     last_hit: float = 0.0
 
 
 class SemanticRouter:
-    """用已注册 Skill 触发语句的 Embedding 重心做快速路由。"""
+    """两层语义路由器的 Embedding 快速匹配层。"""
 
     CONFIDENCE_THRESHOLD = 0.85
 
@@ -93,9 +95,67 @@ class SemanticRouter:
 
         self._embedder = embedder
         self._confidence_threshold = confidence_threshold
-        self._routes: dict[str, _SemanticRoute] = {}
+        self._routes: dict[str, SkillRoute] = {}
+        self._vector_matrix: np.ndarray | None = None
+        self._skill_ids: list[str] = []
         self._signature: tuple[tuple[str, int, bool, tuple[str, ...]], ...] = ()
         self._lock = threading.RLock()
+
+    def register_skill(
+        self,
+        skill_id: str,
+        skill_name: str,
+        trigger_patterns: list[str],
+        skill: SkillDefinition | None = None,
+    ) -> None:
+        """输入：Skill 标识 ``skill_id``、名称 ``skill_name``、触发语句 ``trigger_patterns`` 及可选完整定义 ``skill``。
+
+        输出：无；注册或覆盖指定 Skill，并重建 NumPy 重心向量矩阵。
+        功能：按文档示例将一个 Skill 的触发语句聚合为 L2 归一化重心；生产路径额外保留完整定义以注入其工作流。
+        """
+
+        patterns = tuple(
+            normalized
+            for pattern in trigger_patterns
+            if (normalized := self._normalize(pattern))
+        )
+        if not patterns:
+            return
+        embeddings = np.asarray(self._embed_many(patterns), dtype=np.float64)
+        if embeddings.ndim != 2 or not embeddings.shape[1] or not np.isfinite(embeddings).all():
+            raise ValueError("Embedding 向量无效")
+        centroid = embeddings.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if not norm:
+            raise ValueError("Embedding 向量不能为零")
+        with self._lock:
+            previous = self._routes.get(skill_id)
+            self._routes[skill_id] = SkillRoute(
+                skill_id=skill_id,
+                skill_name=skill_name,
+                trigger_patterns=patterns,
+                centroid_vector=centroid / norm,
+                skill=skill,
+                hit_count=previous.hit_count if previous else 0,
+                last_hit=previous.last_hit if previous else 0.0,
+            )
+            self._rebuild_matrix()
+
+    def _rebuild_matrix(self) -> None:
+        """输入：隐式读取已注册的 ``_routes``。
+
+        输出：无；无路由时清空矩阵，否则更新 N×D 的归一化重心矩阵。
+        功能：建立矩阵行号到 Skill 标识的稳定映射，使一次矩阵乘法即可计算所有候选的余弦相似度。
+        """
+
+        if not self._routes:
+            self._vector_matrix = None
+            self._skill_ids = []
+            return
+        self._skill_ids = list(self._routes)
+        self._vector_matrix = np.stack(
+            [self._routes[skill_id].centroid_vector for skill_id in self._skill_ids]
+        )
 
     def warm(self, skills: list[SkillDefinition]) -> None:
         """输入：启动阶段或后台更新时加载的 ``skills``。
@@ -110,75 +170,74 @@ class SemanticRouter:
     def route(
         self,
         query: str,
-        skills: list[SkillDefinition],
-        available_tools: set[str],
+        skills: list[SkillDefinition] | None = None,
+        available_tools: set[str] | None = None,
     ) -> RouteResult:
-        """输入：本轮问题 ``query``、已加载 Skills 及可调用工具集合 ``available_tools``。
+        """输入：本轮问题 ``query``、可选已加载 Skills ``skills`` 及可调用工具集合 ``available_tools``。
 
         输出：高置信度时返回 ``embedding`` 命中的 Skill；否则返回 ``fallback`` 且 Skill 为空。
-        功能：先匹配规范化后的具体触发语句，再以重心或最近样本的余弦相似度选择 Top-1，并在依赖工具不可用时提前排除旧工作流。
+        功能：对查询向量和已注册 Skill 重心矩阵进行一次 Top-1 余弦匹配；传入项目 Skill 时先同步索引并排除依赖工具不可用的工作流。
         """
 
         started_at = time.monotonic()
         normalized_query = self._normalize(query)
-        if len(self._intent_terms(normalized_query)) < 2:
-            logger.info("语义路由回退: reason=insufficient_intent_terms")
+        if not normalized_query:
             return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
         try:
-            self.warm(skills)
+            if skills is not None:
+                self.warm(skills)
         except Exception:
             logger.warning("语义路由 Embedding 不可用，回退 LLM")
             return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
-        candidates = [
-            route
-            for route in self._routes.values()
-            if route.skill.enabled
-            and set(route.skill.required_mcp_tools).issubset(available_tools)
-        ]
-        if not candidates:
+        with self._lock:
+            available = available_tools or set()
+            candidate_indexes = [
+                index
+                for index, skill_id in enumerate(self._skill_ids)
+                if (route := self._routes[skill_id]).skill is None
+                or (
+                    route.skill.enabled
+                    and set(route.skill.required_mcp_tools).issubset(available)
+                )
+            ]
+            matrix = (
+                self._vector_matrix[candidate_indexes]
+                if self._vector_matrix is not None and candidate_indexes
+                else None
+            )
+            skill_ids = [self._skill_ids[index] for index in candidate_indexes]
+        if matrix is None:
             logger.info("语义路由回退: reason=no_available_skill")
             return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
-        exact = next((route for route in candidates if normalized_query in route.patterns), None)
-        if exact is not None:
-            exact.hit_count += 1
-            exact.last_hit = time.time()
-            latency_ms = (time.monotonic() - started_at) * 1000
-            logger.info(
-                "语义路由命中: skill_id=%s confidence=1.00 latency_ms=%.1f source=pattern",
-                exact.skill.skill_id,
-                latency_ms,
-            )
-            return RouteResult(exact.skill.skill_id, 1.0, "embedding", latency_ms)
         try:
-            vector = self._unit_vector(self._embed(normalized_query))
+            vector = np.asarray(self._embed(normalized_query), dtype=np.float64)
+            norm = np.linalg.norm(vector)
+            if vector.ndim != 1 or not norm:
+                raise ValueError("Embedding 向量不能为零")
+            vector = vector / norm
         except Exception:
             logger.warning("语义路由 Embedding 不可用，回退 LLM")
             return RouteResult(None, 0.0, "fallback", (time.monotonic() - started_at) * 1000)
-        scored = [
-            (
-                route,
-                max(
-                    self._cosine_similarity(route.centroid, vector),
-                    *(self._cosine_similarity(pattern_vector, vector) for pattern_vector in route.vectors),
-                ),
-            )
-            for route in candidates
-        ]
-        best, confidence = max(scored, key=lambda item: item[1])
+        similarities = matrix @ vector
+        best_index = int(np.argmax(similarities))
+        confidence = float(similarities[best_index])
+        best_skill_id = skill_ids[best_index]
         if confidence < self._confidence_threshold:
             logger.info("语义路由回退: reason=low_confidence confidence=%.2f", confidence)
             return RouteResult(None, confidence, "fallback", (time.monotonic() - started_at) * 1000)
-        best.hit_count += 1
-        best.last_hit = time.time()
+        with self._lock:
+            best = self._routes[best_skill_id]
+            best.hit_count += 1
+            best.last_hit = time.time()
         latency_ms = (time.monotonic() - started_at) * 1000
         logger.info(
             "语义路由命中: skill_id=%s confidence=%.2f latency_ms=%.1f source=embedding",
-            best.skill.skill_id,
+            best_skill_id,
             confidence,
             latency_ms,
         )
         return RouteResult(
-            best.skill.skill_id,
+            best_skill_id,
             confidence,
             "embedding",
             latency_ms,
@@ -197,32 +256,16 @@ class SemanticRouter:
         )
         if signature == self._signature:
             return
-        routes: dict[str, _SemanticRoute] = {}
+        self._routes = {}
+        self._vector_matrix = None
+        self._skill_ids = []
         for skill in skills:
-            patterns = tuple(
-                normalized
-                for pattern in skill.trigger_patterns
-                if self._is_specific_pattern(normalized := self._normalize(pattern))
-            )
-            vectors = self._embed_many(patterns)
-            if not vectors:
-                continue
-            dimension = len(vectors[0])
-            if not dimension or any(len(vector) != dimension for vector in vectors):
-                continue
-            centroid = self._unit_vector(
-                [sum(vector[index] for vector in vectors) / len(vectors) for index in range(dimension)]
-            )
-            previous = self._routes.get(skill.skill_id)
-            routes[skill.skill_id] = _SemanticRoute(
+            self.register_skill(
+                skill.skill_id,
+                skill.name,
+                skill.trigger_patterns,
                 skill,
-                centroid,
-                patterns,
-                vectors,
-                previous.hit_count if previous else 0,
-                previous.last_hit if previous else 0.0,
             )
-        self._routes = routes
         self._signature = signature
 
     def _embed_many(self, texts: Sequence[str]) -> list[list[float]]:
@@ -254,26 +297,6 @@ class SemanticRouter:
 
         return re.sub(r"@\S+", "", _text(value, 1000)).strip(" ，。！？!?；;：:")
 
-    @staticmethod
-    def _intent_terms(value: str) -> set[str]:
-        """输入：已规范化的用户消息或触发语句 ``value``。
-
-        输出：其中出现的业务意图词集合。
-        功能：以既有退单、售后和统计词表识别可安全直接路由的具体业务表达。
-        """
-
-        return {term for term in _TRIGGER_TERMS if term in value}
-
-    @classmethod
-    def _is_specific_pattern(cls, pattern: str) -> bool:
-        """输入：已规范化的 Skill 触发语句 ``pattern``。
-
-        输出：至少包含两个业务意图词时返回 ``True``。
-        功能：排除“帮我看看最近的情况”类无业务边界的历史样本，避免其污染 Skill 重心并造成误路由。
-        """
-
-        return len(cls._intent_terms(pattern)) >= 2
-
     def _embed(self, text: str) -> list[float]:
         """输入：待向量化的触发语句或用户问题 ``text``。
 
@@ -288,30 +311,6 @@ class SemanticRouter:
         if not vector or not all(math.isfinite(value) for value in vector):
             raise ValueError("Embedding 向量无效")
         return vector
-
-    @staticmethod
-    def _unit_vector(vector: list[float]) -> list[float]:
-        """输入：有限浮点数组成的 ``vector``。
-
-        输出：L2 归一化向量；零向量时抛出 ``ValueError``。
-        功能：把触发语句重心和查询向量规范到同一尺度，使点积等价于余弦相似度。
-        """
-
-        norm = math.sqrt(sum(value * value for value in vector))
-        if not norm:
-            raise ValueError("Embedding 向量不能为零")
-        return [value / norm for value in vector]
-
-    @staticmethod
-    def _cosine_similarity(left: list[float], right: list[float]) -> float:
-        """输入：两个已归一化的向量 ``left`` 与 ``right``。
-
-        输出：维度相同则返回余弦相似度；维度不同返回 ``-1``。
-        功能：使用标准库点积完成候选 Skill 排序，不引入 NumPy 运行时依赖。
-        """
-
-        return sum(a * b for a, b in zip(left, right)) if len(left) == len(right) else -1.0
-
 
 def _text(value: Any, limit: int = 2000) -> str:
     """输入：任意文本值 ``value`` 与最大字符数 ``limit``。
@@ -461,9 +460,9 @@ class SkillEvolutionEngine:
         功能：保存可替换的模型依赖，使执行轨迹评估、语义去重和文件存储可独立测试。
         """
 
-        self._llm = llm
-        self._skills_dir = skills_dir
-        self._embedder = embedder
+        self.llm = llm
+        self.skills_dir = skills_dir
+        self.embedder = embedder
 
     async def evaluate_and_evolve(self, trace: ExecutionTrace) -> SkillDefinition | None:
         """输入：一次任务完成后的 ``ExecutionTrace``。
@@ -477,12 +476,12 @@ class SkillEvolutionEngine:
         extracted = await self._extract_workflow(trace)
         if extracted is None:
             return None
-        similar = await self._find_similar_skill(extracted, self.load_all_skills())
+        similar = await self._find_similar_skill(extracted, self._load_all_skills())
         if similar is not None and similar["similarity"] > SIMILARITY_THRESHOLD:
-            skill = self._update_skill(similar["skill"], extracted, trace.user_query)
+            skill = self._update_skill(similar["skill"], extracted, trace)
             logger.info("Skill 自进化已更新: id=%s version=%s", skill.skill_id, skill.version)
             return skill
-        skill = self._create_skill(extracted, trace.user_query)
+        skill = self._create_skill(extracted, trace)
         logger.info("Skill 自进化已创建: id=%s version=%s", skill.skill_id, skill.version)
         return skill
 
@@ -533,15 +532,15 @@ class SkillEvolutionEngine:
         功能：兼容 Hermes ``acomplete`` 与文档示例的 ``chat`` 两种 LLM 门面，不绑定某一模型 SDK。
         """
 
-        if hasattr(self._llm, "acomplete"):
-            result = await self._llm.acomplete(
+        if hasattr(self.llm, "acomplete"):
+            result = await self.llm.acomplete(
                 [{"role": "user", "content": prompt}],
                 max_tokens=1200,
                 timeout=20,
                 purpose="suning_skill_evolution",
             )
             return getattr(result, "text", result)
-        result = self._llm.chat(prompt)
+        result = self.llm.chat(prompt)
         return await result if inspect.isawaitable(result) else result
 
     async def _find_similar_skill(
@@ -570,7 +569,7 @@ class SkillEvolutionEngine:
         功能：兼容同步或异步 Embedding 客户端，并在余弦计算前阻断 NaN、空向量等无效结果。
         """
 
-        result = self._embedder.embed(text)
+        result = self.embedder.embed(text)
         vector = await result if inspect.isawaitable(result) else result
         normalized = [float(value) for value in vector]
         if not normalized or not all(math.isfinite(value) for value in normalized):
@@ -591,8 +590,8 @@ class SkillEvolutionEngine:
         norm_b = math.sqrt(sum(value * value for value in b))
         return sum(left * right for left, right in zip(a, b)) / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
-    def _create_skill(self, extracted: Mapping[str, Any], user_query: str) -> SkillDefinition:
-        """输入：已校验的自动提取字段 ``extracted`` 与原始用户问题 ``user_query``。
+    def _create_skill(self, extracted: Mapping[str, Any], trace: ExecutionTrace) -> SkillDefinition:
+        """输入：已校验的自动提取字段 ``extracted`` 与完整执行轨迹 ``trace``。
 
         输出：版本为 1 且已写入 Skills Hub 的新 Skill。
         功能：基于稳定名称哈希生成标识，保留原始问法为触发模式，并从工作流推导 MCP 依赖以供后续预检查。
@@ -606,7 +605,7 @@ class SkillEvolutionEngine:
             description=str(extracted["description"]),
             version=1,
             trigger_patterns=list(
-                dict.fromkeys([*extracted["trigger_patterns"], _text(user_query, 300)])
+                dict.fromkeys([*extracted["trigger_patterns"], _text(trace.user_query, 300)])
             ),
             workflow=workflow,
             required_mcp_tools=list(dict.fromkeys(step["tool"] for step in workflow)),
@@ -619,9 +618,9 @@ class SkillEvolutionEngine:
         return skill
 
     def _update_skill(
-        self, skill: SkillDefinition, extracted: Mapping[str, Any], user_query: str
+        self, skill: SkillDefinition, extracted: Mapping[str, Any], trace: ExecutionTrace
     ) -> SkillDefinition:
-        """输入：语义重复的已有 ``skill``、新的已校验字段 ``extracted`` 与原始问题 ``user_query``。
+        """输入：语义重复的已有 ``skill``、新的已校验字段 ``extracted`` 与完整执行轨迹 ``trace``。
 
         输出：版本递增且已重写到磁盘的 Skill。
         功能：合并新触发问法、替换改进后的工作流和输出模板，并同步刷新依赖工具集合。
@@ -632,7 +631,7 @@ class SkillEvolutionEngine:
         skill.usage_count += 1
         skill.trigger_patterns = list(
             dict.fromkeys(
-                [*skill.trigger_patterns, *extracted["trigger_patterns"], _text(user_query, 300)]
+                [*skill.trigger_patterns, *extracted["trigger_patterns"], _text(trace.user_query, 300)]
             )
         )
         skill.workflow = list(extracted["workflow"])
@@ -649,7 +648,7 @@ class SkillEvolutionEngine:
         功能：沿用 Hermes Markdown Skill 约定，并以内嵌 JSON 保存完整工作流而无需新增 YAML 依赖。
         """
 
-        directory = self._skills_dir / skill.skill_id
+        directory = self.skills_dir / skill.skill_id
         directory.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(_skill_payload(skill), ensure_ascii=False, indent=2, sort_keys=True)
         content = (
@@ -662,17 +661,17 @@ class SkillEvolutionEngine:
         )
         (directory / "SKILL.md").write_text(content, encoding="utf-8")
 
-    def load_all_skills(self) -> list[SkillDefinition]:
+    def _load_all_skills(self) -> list[SkillDefinition]:
         """输入：隐式读取配置的 Skills Hub 目录。
 
         输出：所有格式正确的自动沉淀 Skill，按标识排序。
         功能：忽略手工 Skill 或单个损坏文件，确保 Skills Hub 中一个异常不会阻断匹配和进化。
         """
 
-        if not self._skills_dir.is_dir():
+        if not self.skills_dir.is_dir():
             return []
         skills: list[SkillDefinition] = []
-        for path in sorted(self._skills_dir.glob("*/SKILL.md")):
+        for path in sorted(self.skills_dir.glob("*/SKILL.md")):
             matched = _JSON_BLOCK_RE.search(path.read_text(encoding="utf-8"))
             if matched is None:
                 continue
@@ -684,45 +683,6 @@ class SkillEvolutionEngine:
                 skills.append(skill)
         return skills
 
-    def match(self, query: str, available_tools: set[str]) -> SkillDefinition | None:
-        """输入：本轮用户问题 ``query`` 与当前可调用 MCP 工具集合 ``available_tools``。
-
-        输出：触发模式命中且所有依赖可用的 Skill；无匹配或预检查失败时返回 ``None``。
-        功能：在回答前落实文档的 Skill 预检查，工具变更时自动降级为从头推理而非注入旧流程。
-        """
-
-        normalized_query = _text(query, 1000).lower()
-        if not normalized_query:
-            return None
-        for skill in self.load_all_skills():
-            if not skill.enabled:
-                continue
-            if not set(skill.required_mcp_tools).issubset(available_tools):
-                continue
-            if any(_pattern_matches(pattern, normalized_query) for pattern in skill.trigger_patterns):
-                return skill
-        return None
-
-
-def _pattern_matches(pattern: str, query: str) -> bool:
-    """输入：Skill 触发模式 ``pattern`` 和已归一化的小写用户问题 ``query``。
-
-    输出：模式直接包含或带 ``{变量}`` 占位符匹配时返回 ``True``。
-    功能：以极小的正则替换支持“分析{品类}退单原因”类可参数化触发语句，不增加第二个匹配模型调用。
-    """
-
-    normalized_pattern = _text(pattern, 300).lower()
-    if not normalized_pattern:
-        return False
-    expression = re.escape(normalized_pattern)
-    expression = re.sub(r"\\\{[^}]+\\\}", ".+", expression)
-    if re.search(expression, query):
-        return True
-    pattern_terms = {term for term in _TRIGGER_TERMS if term in normalized_pattern}
-    query_terms = {term for term in _TRIGGER_TERMS if term in query}
-    return len(pattern_terms) >= 2 and pattern_terms.issubset(query_terms)
-
-
 @dataclass
 class _TrackedTurn:
     """回答前后 Hook 间短暂保存的当前轮轨迹。"""
@@ -730,6 +690,51 @@ class _TrackedTurn:
     user_query: str
     started_at: float
     mcp_calls: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _trace_turns(
+    conversation_history: Any,
+    user_query: str,
+    mcp_calls: list[dict[str, Any]],
+    final_output: str,
+) -> list[dict[str, Any]]:
+    """输入：Hermes 历史消息 ``conversation_history``、本轮问题 ``user_query``、工具调用 ``mcp_calls`` 与最终回答 ``final_output``。
+
+    输出：最多十条按用户问题配对的执行轮次，当前轮附带实际 MCP 参数。
+    功能：复用 Hermes 已提供的多轮会话历史补足文档要求的完整轨迹，不依赖宿主未声明的工具完成 Hook。
+    """
+
+    turns: list[dict[str, Any]] = []
+    pending_user = ""
+    history = (
+        conversation_history[-20:]
+        if isinstance(conversation_history, Sequence)
+        and not isinstance(conversation_history, (str, bytes, bytearray))
+        else []
+    )
+    for message in history:
+        if not isinstance(message, Mapping):
+            continue
+        role = _text(message.get("role"), 30).lower()
+        content = _text(message.get("content") or message.get("text"), 1500)
+        if role == "user":
+            if pending_user:
+                turns.append({"user_msg": pending_user, "mcp_calls": [], "result_summary": ""})
+            pending_user = content
+        elif role == "assistant" and pending_user:
+            turns.append({"user_msg": pending_user, "mcp_calls": [], "result_summary": content})
+            pending_user = ""
+    query = _text(user_query, 2000)
+    output = _text(final_output, 3000)
+    if pending_user and pending_user != query:
+        turns.append({"user_msg": pending_user, "mcp_calls": [], "result_summary": ""})
+    if query:
+        current = {"user_msg": query, "mcp_calls": mcp_calls, "result_summary": output}
+        if turns and turns[-1]["user_msg"] == query and turns[-1]["result_summary"] == output:
+            turns[-1] = current
+        else:
+            turns.append(current)
+    return turns[-10:]
 
 
 class SkillEvolutionHooks:
@@ -744,7 +749,7 @@ class SkillEvolutionHooks:
 
         self._engine = engine
         self._available_tools = set(available_tools)
-        self._router = SemanticRouter(engine._embedder)
+        self._router = SemanticRouter(engine.embedder)
         self._turns: dict[tuple[str, str], _TrackedTurn] = {}
         self._lock = threading.RLock()
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -761,7 +766,7 @@ class SkillEvolutionHooks:
         功能：供 Gateway 启动和自进化后台在无用户请求时刷新语义路由索引。
         """
 
-        self._router.warm(self._engine.load_all_skills())
+        self._router.warm(self._engine._load_all_skills())
 
     def pre_llm_call(
         self, *, session_id: str = "", turn_id: str = "", user_message: Any = "", **_kwargs: Any
@@ -780,7 +785,7 @@ class SkillEvolutionHooks:
                 self._turns[(session, turn)] = _TrackedTurn(query, time.monotonic())
                 while len(self._turns) > MAX_TRACKED_TURNS:
                     self._turns.pop(next(iter(self._turns)))
-        skills = self._engine.load_all_skills()
+        skills = self._engine._load_all_skills()
         route = self._router.route(query, skills, self._available_tools)
         skill = next((item for item in skills if item.skill_id == route.skill_id), None)
         if skill is None:
@@ -817,9 +822,15 @@ class SkillEvolutionHooks:
                 tracked.mcp_calls.append({"tool": _text(tool_name, 100), "params": params})
 
     def post_llm_call(
-        self, *, session_id: str = "", turn_id: str = "", assistant_response: Any = "", **_kwargs: Any
+        self,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        assistant_response: Any = "",
+        conversation_history: Any = None,
+        **_kwargs: Any,
     ) -> None:
-        """输入：逻辑会话、轮次、最终回答及其他 Hermes 生命周期字段。
+        """输入：逻辑会话、轮次、最终回答、Hermes 历史消息及其他生命周期字段。
 
         输出：无；符合复杂度门禁时在后台提交自进化任务。
         功能：结束轨迹采集且绝不阻塞用户回复，模型或磁盘失败由后台任务隔离记录。
@@ -831,12 +842,18 @@ class SkillEvolutionHooks:
             tracked = self._turns.pop((session, turn), None)
         if tracked is None:
             return
+        final_output = _text(assistant_response, 3000)
         trace = ExecutionTrace(
             user_query=tracked.user_query,
-            turns=[{"user_msg": tracked.user_query, "mcp_calls": tracked.mcp_calls, "result_summary": _text(assistant_response, 1500)}],
+            turns=_trace_turns(
+                conversation_history,
+                tracked.user_query,
+                tracked.mcp_calls,
+                final_output,
+            ),
             mcp_tools_used=[call["tool"] for call in tracked.mcp_calls],
             total_duration_seconds=time.monotonic() - tracked.started_at,
-            final_output=_text(assistant_response, 3000),
+            final_output=final_output,
         )
         if self._engine._calc_complexity(trace) < EVOLUTION_COMPLEXITY_THRESHOLD:
             return
@@ -910,6 +927,7 @@ __all__ = [
     "SemanticRouter",
     "SIMILARITY_THRESHOLD",
     "SkillDefinition",
+    "SkillRoute",
     "SkillEvolutionEngine",
     "SkillEvolutionHooks",
     "build_skill_evolution_hooks",

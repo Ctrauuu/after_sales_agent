@@ -235,6 +235,7 @@ def _identity_engine() -> sa.Engine:
                 "('U-H001', 'feishu', 'ou_zhang'), "
                 "('U-H001', 'wecom', 'zhangsan'), "
                 "('U-H001', 'dingtalk', 'ding_zhang'), "
+                "('U-H001', 'cron', 'precompute-daily'), "
                 "('U-H002', 'feishu', 'ou_disabled')"
             )
         )
@@ -304,6 +305,27 @@ def test_router_rejects_unbound_and_disabled_users(monkeypatch: pytest.MonkeyPat
             platform="feishu",
             chat_type="dm",
         )
+
+
+def test_router_uses_fixed_cron_service_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：Hermes Cron 标记、服务主体配置和带 Cron 绑定的内存身份表。
+
+    输出：无；Cron 未路由到固定主体或配置缺失仍被接受时由 pytest 报告失败。
+    功能：验证调度任务不继承聊天用户身份，只能作为数据库中绑定的内部服务主体执行。
+    """
+
+    identity, _session_values = _load_identity_session(monkeypatch)
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setenv("SUNING_CRON_SERVICE_SUBJECT", "precompute-daily")
+    router = identity.IdentitySessionRouter(_identity_engine(), _FakeRedis())
+
+    route = router.resolve(session_id="cron_test_20260823")
+
+    assert route.hermes_user_id == "U-H001"
+    assert route.platform == "cron"
+    assert route.chat_type == "dm"
 
 
 def test_unified_hooks_forward_hermes_identity_and_reject_unknown_user(

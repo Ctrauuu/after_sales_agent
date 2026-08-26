@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import threading
 import time
@@ -14,6 +15,8 @@ from gateway.session_context import get_session_env  # type: ignore
 
 
 TRUSTED_PLATFORMS = frozenset({"feishu", "wecom", "dingtalk"})
+CRON_PLATFORM = "cron"
+CRON_SERVICE_SUBJECT_ENV = "SUNING_CRON_SERVICE_SUBJECT"
 DIRECT_CHAT_TYPES = frozenset({"dm", "direct", "private", "p2p"})
 GROUP_CHAT_TYPES = frozenset({"group", "channel", "forum", "thread"})
 ACTIVE_SESSION_TTL_SECONDS = 30 * 60
@@ -268,19 +271,29 @@ class IdentitySessionRouter:
         platform: str = "",
         chat_type: str = "",
     ) -> SessionRoute:
-        """输入：原始 Hermes 会话、可选发送者及可选平台/会话类型；缺失字段从可信 ContextVar 读取。
+        """输入：原始 Hermes 会话、可选发送者及可选平台/会话类型；缺失字段从可信 ContextVar 或 Cron 服务配置读取。
 
         输出：绑定启用 ``hermes_user_id`` 的逻辑会话路由；未绑定、停用或不可信字段时抛出 ``IdentityResolutionError``。
         功能：私聊以 Redis 30 分钟活跃键跨平台复用结构化上下文，群聊仅创建用户隔离的群内上下文。
         """
 
         source_session = _text(session_id)
+        is_cron = (
+            os.getenv("HERMES_CRON_SESSION", "").strip() == "1"
+            and source_session.startswith("cron_")
+        )
         resolved_platform = _text(platform or get_session_env("HERMES_SESSION_PLATFORM", "")).lower()
         external_subject = _text(sender_id or get_session_env("HERMES_SESSION_USER_ID", ""))
         resolved_chat_type = _text(chat_type or get_session_env("HERMES_SESSION_CHAT_TYPE", "")).lower()
         if not source_session:
             raise IdentityResolutionError("当前请求没有可信的 Hermes 会话标识")
-        if resolved_platform not in TRUSTED_PLATFORMS:
+        if is_cron:
+            resolved_platform = CRON_PLATFORM
+            external_subject = _text(os.getenv(CRON_SERVICE_SUBJECT_ENV, ""))
+            resolved_chat_type = "dm"
+        elif resolved_platform == CRON_PLATFORM:
+            raise IdentityResolutionError("cron 身份仅允许 Hermes 调度器使用")
+        elif resolved_platform not in TRUSTED_PLATFORMS:
             raise IdentityResolutionError("当前请求的平台身份无效")
         if not external_subject or len(external_subject) > 128:
             raise IdentityResolutionError("当前请求的平台用户身份无效")

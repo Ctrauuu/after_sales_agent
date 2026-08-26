@@ -256,6 +256,7 @@ question / structured stats params
 - `ReadOnlyExecutor.run()`：最终数据库执行边界。
 - `NL2SQLPipeline.run()`：只对 SQL 校验或数据库错误做最多两轮纠错。
 - `query_aftersale_nl2sql()`：自由自然语言动态分析入口。
+- `query_sku_return_rate()`：以订单-SKU 明细为分母的固定退单订单率统计入口。
 
 ### 8. 与其他模块关系
 

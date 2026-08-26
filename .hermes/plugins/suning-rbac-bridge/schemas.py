@@ -149,6 +149,39 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             },
         },
     ),
+    "query_sku_return_rate": ToolSpec(
+        server_id="mcp-aftersale",
+        degrade_level=DegradeLevel.L2_CORE,
+        retry_on_timeout=True,
+        empty_result_is_success=True,
+        endpoint_env="SUNING_MCP_AFTERSALE_URL",
+        default_endpoint="http://127.0.0.1:8102/mcp",
+        schema={
+            "name": "query_sku_return_rate",
+            "description": (
+                "按订单创建时间计算 SKU 退单订单率，"
+                "返回退单订单数、订单数和退单率最高的 SKU；不使用 NL2SQL。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_range_days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 30,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 5,
+                    },
+                    "category": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    ),
     "get_aftersale_workflow": ToolSpec(
         server_id="mcp-aftersale",
         degrade_level=DegradeLevel.L1_NON_CRITICAL,

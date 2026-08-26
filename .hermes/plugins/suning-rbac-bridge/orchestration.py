@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping
 from tools.registry import tool_error, tool_result  # type: ignore
 
 from .bridge import current_identity
+from .harness import AgentHarness
 
 
 logger = logging.getLogger(__name__)
@@ -276,30 +277,18 @@ def _task_context(task: SubTask, dag: TaskDAG, date_range_days: int) -> str:
     )
 
 
-def _launch_request(**kwargs: Any) -> Any:
-    """输入：公开生命周期启动请求的关键字参数 ``kwargs``。
-
-    输出：Hermes ``SubagentLaunchRequest`` 实例；生命周期模块不可用时抛出导入异常。
-    功能：延迟读取 Hermes 生命周期类型，保证只加载插件配置或 Hooks 时不强制依赖 Agent 运行时。
-    """
-
-    from agent.subagent_lifecycle import SubagentLaunchRequest
-
-    return SubagentLaunchRequest(**kwargs)
-
-
 class TaskOrchestrator:
     """使用 Hermes 公共子 Agent 生命周期执行受限售后分析 DAG。"""
 
-    def __init__(self, llm: Any, lifecycle: Any) -> None:
-        """输入：宿主 LLM 门面 ``llm`` 和公开子 Agent 生命周期 ``lifecycle``。
+    def __init__(self, llm: Any, harness: AgentHarness) -> None:
+        """输入：宿主 LLM 门面 ``llm`` 和子 Agent Harness ``harness``。
 
         输出：初始化可复用的编排器实例。
-        功能：保存受 Hermes 管理的规划、聚合和子 Agent 派发能力，不接触私有 Agent 对象。
+        功能：保存规划、聚合和统一子 Agent 生命周期管理能力，使所有查询节点经过同一 Harness。
         """
 
         self._llm = llm
-        self._lifecycle = lifecycle
+        self._harness = harness
 
     async def plan(self, query: str, date_range_days: int) -> TaskDAG:
         """输入：用户分析问题 ``query`` 与日期窗口 ``date_range_days``。
@@ -393,45 +382,27 @@ class TaskOrchestrator:
                 + (f" 当前不可用维度：{', '.join(unavailable)}。" if unavailable else "")
             )
             return
+        remaining = min(task.timeout_seconds, max(0.0, deadline - time.monotonic()))
         try:
-            handle = self._lifecycle.launch(
-                _launch_request(
-                    goal=_task_context(task, dag, date_range_days),
-                    context="这是当前 IM 会话的受控售后分析子任务。",
-                    role="leaf",
-                    allowed_toolsets=("suning_business",),
-                    correlation_id=f"suning-analysis-{task.task_id}-{int(time.time() * 1000)}",
-                    metadata={"task_type": task.task_type},
-                )
+            task.summary = await self._harness.run(
+                task_id=task.task_id,
+                agent_type=task.task_type,
+                goal=(
+                    f"你是售后分析子 Agent，专长是 {task.task_type}。\n"
+                    f"本节点目标：{task.description}"
+                ),
+                context=_task_context(task, dag, date_range_days),
+                timeout_seconds=remaining,
             )
+        except TimeoutError:
+            task.status = TaskStatus.TIMEOUT
+            task.error = "子任务超时"
+            return
         except Exception as exc:
             task.status = TaskStatus.FAILED
             task.error = _compact_text(exc, limit=300)
             return
-
-        remaining = min(task.timeout_seconds, max(0.0, deadline - time.monotonic()))
-        terminal = await asyncio.to_thread(
-            self._lifecycle.wait, handle, timeout_seconds=remaining
-        )
-        if getattr(terminal, "timed_out", False):
-            await asyncio.to_thread(self._lifecycle.cancel, handle, reason="子任务超过时间上限")
-            task.status = TaskStatus.TIMEOUT
-            task.error = "子任务超时"
-            return
-
-        result = self._lifecycle.result(handle)
-        terminal_state = getattr(result, "terminal_state", None)
-        if getattr(terminal_state, "value", terminal_state) == "SUCCEEDED":
-            task.status = TaskStatus.SUCCESS
-            task.summary = _compact_text(getattr(result, "summary", "")) or "子任务未返回可用摘要"
-            return
-        task.status = TaskStatus.FAILED
-        task.error = _compact_text(
-            getattr(result, "error_message", None)
-            or getattr(result, "error_classification", None)
-            or "子任务未成功完成",
-            limit=300,
-        )
+        task.status = TaskStatus.SUCCESS
 
     async def aggregate(self, dag: TaskDAG) -> str:
         """输入：已执行的任务图 ``dag``。
@@ -517,8 +488,6 @@ def make_complex_analysis_handler(llm: Any, lifecycle: Any):
     功能：绑定主机托管能力，并将平台范围和 DAG 编排限制封装在单个工具入口中。
     """
 
-    orchestrator = TaskOrchestrator(llm, lifecycle)
-
     async def handler(args: dict[str, Any], **_kwargs: Any) -> str:
         """输入：模型传入参数 ``args``；其余 Hermes 参数由 ``_kwargs`` 接收。
 
@@ -538,6 +507,8 @@ def make_complex_analysis_handler(llm: Any, lifecycle: Any):
         date_range_days = _bounded_int(
             (args or {}).get("date_range_days"), 30, 1, 90
         )
+        harness = AgentHarness(lifecycle)
+        orchestrator = TaskOrchestrator(llm, harness)
         dag = await orchestrator.plan(query, date_range_days)
         await orchestrator.run(dag, date_range_days)
         report = await orchestrator.aggregate(dag)
@@ -552,6 +523,7 @@ def make_complex_analysis_handler(llm: Any, lifecycle: Any):
                 "report": report,
                 "unavailable_sections": unavailable,
                 "tasks": [_task_payload(task) for task in dag.sub_tasks],
+                "harness": harness.snapshot(),
             }
         )
 
@@ -561,6 +533,7 @@ def make_complex_analysis_handler(llm: Any, lifecycle: Any):
 __all__ = [
     "COMPLEX_ANALYSIS_SCHEMA",
     "DEFAULT_GLOBAL_TIMEOUT_SECONDS",
+    "AgentHarness",
     "SubTask",
     "TaskDAG",
     "TaskDAGValidationError",

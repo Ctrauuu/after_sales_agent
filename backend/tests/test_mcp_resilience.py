@@ -137,7 +137,7 @@ def bridge_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     )
     observability.start_mcp_span.return_value = object()
     monkeypatch.setattr(bridge, "observability", observability)
-    monkeypatch.setattr(bridge, "_result_rows", Mock(return_value=1))
+    monkeypatch.setattr(bridge, "result_rows", Mock(return_value=1))
     return bridge
 
 

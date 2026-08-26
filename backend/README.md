@@ -62,8 +62,9 @@ journalctl -u suning-mcp@order.service -f
 `User`、`Group`，不复制单独的 service 文件。
 
 动态分析工具 `query_return_stats_nl2sql` 和 `query_aftersale_nl2sql` 共用
-`nl2sql.runtime.nl2sql_pipeline`。订单搜索/详情、售后流程、商品、物流和退款状态等明确业务 API
-继续使用固定参数化 SQL。
+`nl2sql.runtime.nl2sql_pipeline`。`query_sku_return_rate` 按订单创建时间以固定参数化 SQL
+计算 SKU 退单订单率（退单订单数 ÷ 包含该 SKU 的订单数），不调用 NL2SQL。订单搜索/详情、售后流程、
+商品、物流和退款状态等明确业务 API 也继续使用固定参数化 SQL。
 
 ## MCP 调用链路观测
 
@@ -132,6 +133,8 @@ mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migr
 mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migrations/002_repair_mock_category_names.sql
 mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migrations/003_repair_mock_business_labels.sql
 mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migrations/004_register_order_timeline.sql
+mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migrations/007_complete_mcp_registry_metadata.sql
+mysql --default-character-set=utf8mb4 -u <user> -p <database> < infra/mysql/migrations/008_add_sku_return_rate_tool.sql
 ```
 
 随后重启 `mcp_suning.servers.aftersale`，并刷新 Hermes 的 MCP Tool 列表。

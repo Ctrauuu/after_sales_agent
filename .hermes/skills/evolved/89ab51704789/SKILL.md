@@ -14,8 +14,9 @@ description: 复用 query_return_stats_nl2sql 按品类、原因、日趋势三�
   "avg_quality_score": 0.0,
   "created_at": "2026-08-15T13:45:36.838831+00:00",
   "description": "复用 query_return_stats_nl2sql 按品类、原因、日趋势三个维度分析指定品类在指定时间窗口内的退单原因，并输出结构化结论与数据局限提示。适用于任意品类和任意近 N 天退单分析。",
+  "enabled": true,
   "name": "return-order-reason-analysis",
-  "output_template": "## 近 {date_range_days} 天退单综合分析 ### ① 按日趋势 {return_daily_trend} ### ② 按品类构成 {return_by_category} ### ③ 按退单原因 {return_by_reason} ### ④ 退款金额 - 如金额字段脱敏，需说明无法提供实时金额；否则展示退款金额汇总。 ### 结论 1. 趋势：识别峰值/异常日并说明形态。 2. 品类：占比最高的品类。 3. 原因：主要原因簇及其关联。 4. 数据覆盖：说明样本量与数据完整性限制。 ### 图表建议 | 图表 | 类型 | labels | values | 用途 | |---|---|---|---|---| | 退单量按日趋势 | 折线图 (trend) | {daily_labels} | {daily_values} | 展示趋势与峰值 | | 品类占比 | 饼图 (proportion) | {category_labels} | {category_values} | 展示品类构成 | | 原因分布 | 条形图 (bar) | {reason_labels} | {reason_values} | 展示主要原因 |",
+  "output_template": "## {category}退单原因分布（实时查询 · 近{date_range_days}天） | 原因码 | 原因 | 退单量 | 占比 | |---|---|---|---| {reason_rows} | **合计** | | **{total_returns}** | 100% | **结论** 1. **首要原因**：**{top_reason_code} {top_reason_name}（{top_reason_count} 单，{top_reason_percent}）**；若存在同簇原因，合并后指出最大原因簇及占比。 2. **次因**：{secondary_reasons}。 3. 其他原因：{other_reasons}。 **提示**：{date_range_days} 天窗口实际覆盖 {actual_date_range}，样本 {total_returns} 单，占比为定性参考；{extra_notes}。",
   "required_mcp_tools": [
     "query_return_stats_nl2sql"
   ],
@@ -65,37 +66,26 @@ description: 复用 query_return_stats_nl2sql 按品类、原因、日趋势三�
     "退单分析",
     "退货/退款多维统计",
     "按日/品类/原因分析退单数据",
-    "请分析近30天退单趋势、主要品类、原因和退款金额，并给出图表建议。"
+    "请分析近30天退单趋势、主要品类、原因和退款金额，并给出图表建议。",
+    "{category}退单原因分布",
+    "{category}的退单原因",
+    "查询近{date_range_days}天{category}退单原因分布",
+    "退单原因分布是什么",
+    "按原因统计{category}退单",
+    "空调退单原因分布"
   ],
-  "updated_at": "2026-08-16T08:42:08.835786+00:00",
-  "usage_count": 10,
-  "version": 10,
+  "updated_at": "2026-08-25T13:07:56.851959+00:00",
+  "usage_count": 11,
+  "version": 11,
   "workflow": [
     {
-      "output_key": "return_daily_trend",
+      "output_key": "return_stats",
       "params": {
-        "date_range_days": "{date_range_days}",
-        "group_by": "day"
-      },
-      "step": 1,
-      "tool": "query_return_stats_nl2sql"
-    },
-    {
-      "output_key": "return_by_category",
-      "params": {
-        "date_range_days": "{date_range_days}",
-        "group_by": "category"
-      },
-      "step": 2,
-      "tool": "query_return_stats_nl2sql"
-    },
-    {
-      "output_key": "return_by_reason",
-      "params": {
+        "category": "{category}",
         "date_range_days": "{date_range_days}",
         "group_by": "reason"
       },
-      "step": 3,
+      "step": 1,
       "tool": "query_return_stats_nl2sql"
     }
   ]

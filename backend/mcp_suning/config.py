@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     # 管理后台只读 Hermes 状态并写现有 Skill Hub；令牌为空时仅允许环回访问。
     suning_admin_api_token: str = ""
+    suning_admin_mysql_user: str = ""
+    suning_admin_mysql_password: str = ""
     hermes_home: str = "~/.hermes"
     skill_evolution_dir: str = ""
 
@@ -27,6 +29,8 @@ class Settings(BaseSettings):
     suning_mcp_bridge_secret: str = ""
     suning_identity_issuer: str = ""
     suning_authn_require_redis: bool = True
+    # 仅 Hermes 调度器可使用的内部服务主体；为空时 Cron 调用默认拒绝。
+    suning_cron_service_subject: str = ""
 
     # 订单全链路聚合服务通过私有 MCP 并发调用下游服务；与 Hermes 插件的地址可独立部署。
     suning_mcp_order_url: str = "http://127.0.0.1:8101/mcp"

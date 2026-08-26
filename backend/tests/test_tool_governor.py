@@ -111,6 +111,7 @@ def test_tool_governor_restricts_scene_and_hides_schema_details() -> None:
     )
 
     assert "get_order_detail" not in whitelist.tools
+    assert "query_sku_return_rate" in whitelist.tools
     assert "get_order_detail" in governor.build_tool_prompt(
         governor.get_scene_tools("order_query")
     )
@@ -171,7 +172,7 @@ def test_tool_governor_reuses_cache_and_enforces_redis_budget() -> None:
     for tool_name, params in (
         ("search_orders", {}),
         ("query_return_stats_nl2sql", {}),
-        ("get_product_info", {"sku_code": "SKU-1"}),
+        ("query_sku_return_rate", {}),
     ):
         assert governor.preflight(
             tool_name=tool_name,
@@ -185,7 +186,8 @@ def test_tool_governor_reuses_cache_and_enforces_redis_budget() -> None:
     )
     assert over_budget.error == (
         "本轮MCP调用已达上限(3次)，请缩小查询范围。"
-        "剩余可用工具: ['search_orders', 'query_return_stats_nl2sql', 'get_product_info', "
-        "'get_order_detail', 'get_aftersale_workflow', 'query_logistics', 'get_refund_status']"
+        "剩余可用工具: ['search_orders', 'query_return_stats_nl2sql', 'query_sku_return_rate', "
+        "'get_product_info', 'get_order_detail', 'get_aftersale_workflow', 'query_logistics', "
+        "'get_refund_status']"
     )
     assert governor_module.TURN_TTL_SECONDS in redis_client.expirations.values()

@@ -1,7 +1,7 @@
 # NL2SQL 实现与代码阅读顺序
 
 设计依据是 [`05b-NL2SQL可靠生成.md`](../../docs/05-技术重难点/05b-NL2SQL可靠生成.md)。
-当前两个动态售后分析工具共用一条 Pipeline：
+两个动态售后分析工具共用一条 Pipeline：
 
 ```text
 自然语言问题或结构化统计参数
@@ -23,6 +23,7 @@
 | --- | --- | --- |
 | `query_return_stats_nl2sql` | 共用 NL2SQL Pipeline | 分组维度和统计组合会扩展，属于动态聚合 |
 | `query_aftersale_nl2sql` | 共用 NL2SQL Pipeline | 承接复杂运营分析、组合指标和临时统计 |
+| `query_sku_return_rate` | 固定参数化 SQL | SKU 退单率依赖订单-SKU 明细分母，必须保持口径稳定 |
 | `search_orders` | 固定 SQL | 状态、品类、时间等筛选参数明确 |
 | `get_order_detail` | 固定 SQL | 按订单 ID 查询，结构固定 |
 | `get_aftersale_workflow` | 固定 SQL | 按退单 ID 查询固定流程字段 |
@@ -30,15 +31,15 @@
 | `query_logistics` | 固定 SQL | 按退单 ID 查询物流轨迹 |
 | `get_refund_status` | 固定 SQL | 按退单 ID 查询退款状态 |
 
-“复杂运营数据分析”和“临时统计查询”是 `query_aftersale_nl2sql` 的使用场景，不新增同义 MCP
-Tool。这样可以避免 Agent 在多个能力重叠的工具之间误选。
+“复杂运营数据分析”和“临时统计查询”仍由 `query_aftersale_nl2sql` 承接。`query_sku_return_rate`
+是有明确分母和稳定返回结构的核心指标，不与 NL2SQL 重叠。
 
 固定业务 API 不调用模型，因为固定 SQL 延迟更低、返回结构更稳定，也更容易测试。
 
 ### 1.1 Hermes 中的工具名
 
-两个动态工具通过 `.hermes/plugins/suning-rbac-bridge` 注册到 `suning_business` toolset，Agent 调用时
-使用裸名称 `query_return_stats_nl2sql` 和 `query_aftersale_nl2sql`。插件的 `schemas.py`、
+三个售后分析工具通过 `.hermes/plugins/suning-rbac-bridge` 注册到 `suning_business` toolset，Agent 调用时
+使用裸名称 `query_return_stats_nl2sql`、`query_aftersale_nl2sql` 和 `query_sku_return_rate`。插件的 `schemas.py`、
 `plugin.yaml`、MCP 的 `@mcp.tool` 名称以及数据库工具注册表必须完全一致；不要猜测 `mcp__`、点号或
 冒号前缀。修改桥接 schema 后需要重启 Hermes gateway，已加载旧工具说明的会话还应重新开始会话。
 
@@ -47,18 +48,22 @@ Tool。这样可以避免 Agent 在多个能力重叠的工具之间误选。
 
 ## 2. 推荐阅读顺序
 
-### 第一步：两个动态 MCP 入口
+### 第一步：售后分析 MCP 入口
 
 先看 [`servers/aftersale.py`](../mcp_suning/servers/aftersale.py)：
 
 1. `query_return_stats_nl2sql`
 2. `query_aftersale_nl2sql`
+3. `query_sku_return_rate`
 
 `query_return_stats_nl2sql` 保留稳定的结构化参数接口，支持 `day`、`category`、`reason`、`region`、
 `brand` 五个分组维度。它把授权后的统计参数转换成受控问题，再调用 Pipeline。
 
 `query_aftersale_nl2sql` 直接接收自然语言，用于固定统计参数表达不了的组合维度、复杂运营分析和
 临时统计。
+
+`query_sku_return_rate` 接收日期、Top N 和品类参数，以订单创建时间为统计窗口，分母取订单-SKU
+明细；退单条件保留在 `LEFT JOIN`，确保无退单订单仍进入分母。
 
 ### 第二步：共用 Pipeline 的创建位置
 

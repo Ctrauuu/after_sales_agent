@@ -376,6 +376,12 @@ class MCPCallManager:
 
         输出：可在无 Redis 时运行的 Manager；不执行网络调用。
         功能：有 Client 时启用 CircuitStore，无 Client 时保持 MCP 调用 fail-open。
+        有 Redis Client
+        → 开启熔断状态管理
+
+        无 Redis Client
+        → 不开启熔断
+        → 但不影响 MCP 正常调用
         """
 
         self.circuit_store = CircuitStore(redis_client) if redis_client is not None else None

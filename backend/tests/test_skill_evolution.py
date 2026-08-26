@@ -175,7 +175,7 @@ async def test_evolution_creates_updates_and_reloads_markdown_skill(tmp_path: Pa
     assert updated.workflow[0]["params"]["days"] == 30
     skill_file = tmp_path / created.skill_id / "SKILL.md"
     assert skill_file.is_file()
-    assert "分析电视退单原因" in engine.load_all_skills()[0].trigger_patterns
+    assert "分析电视退单原因" in engine._load_all_skills()[0].trigger_patterns
 
 
 @pytest.mark.asyncio
@@ -269,9 +269,62 @@ async def test_semantic_router_routes_high_confidence_skill_and_falls_back(tmp_p
 
     assert routed is not None
     assert "语义路由" in routed["context"]
-    assert "置信度 1.00" in routed["context"]
+    assert "置信度 0.95" in routed["context"]
     assert fallback is None
     assert embedder.batch_calls == 1
+
+
+def test_semantic_router_registers_skill_into_numpy_matrix() -> None:
+    """输入：确定性 Embedding 与文档形式的 ``register_skill`` 调用。
+
+    输出：无；矩阵未创建或 Top-1 未返回已注册标识时由断言报告失败。
+    功能：验证公开注册入口构建 N×D NumPy 重心矩阵，并兼容不依赖 Skills Hub 的独立路由用法。
+    """
+
+    module = _load_skill_evolution()
+    router = module.SemanticRouter(_FakeEmbedder())
+    router.register_skill(
+        "return_stats",
+        "退单统计",
+        ["退单量多少", "最近退单多吗", "哪个品类退单最多", "退单趋势怎么样"],
+    )
+
+    routed = router.route("最近退单数量怎么样")
+
+    assert router._vector_matrix is not None
+    assert router._vector_matrix.shape == (1, 2)
+    assert routed.skill_id == "return_stats"
+    assert routed.method == "embedding"
+
+
+def test_trace_turns_reuses_history_and_attaches_current_tool_calls() -> None:
+    """输入：两轮 Hermes 历史、本轮问题、实际 MCP 调用与最终回答。
+
+    输出：无；历史轮次丢失或当前调用未附着时由断言报告失败。
+    功能：验证自进化使用宿主已提供的多轮会话历史，并只把本轮工具参数送入工作流抽取。
+    """
+
+    module = _load_skill_evolution()
+    calls = [{"tool": "query_return_stats_nl2sql", "params": {"category": "电视"}}]
+
+    turns = module._trace_turns(
+        [
+            {"role": "user", "content": "先看空调退单"},
+            {"role": "assistant", "content": "空调主要是安装问题。"},
+            {"role": "user", "content": "再分析电视退单"},
+        ],
+        "再分析电视退单",
+        calls,
+        "电视主要是质量问题。",
+    )
+
+    assert len(turns) == 2
+    assert turns[0]["result_summary"] == "空调主要是安装问题。"
+    assert turns[-1] == {
+        "user_msg": "再分析电视退单",
+        "mcp_calls": calls,
+        "result_summary": "电视主要是质量问题。",
+    }
 
 
 @pytest.mark.asyncio

@@ -241,6 +241,13 @@ def test_aggregated_scope_blocks_detail_tools_and_allows_real_aggregate() -> Non
     )
     assert nl2sql_safe["data_scope"] == "aggregated"
 
+    sku_rate_safe = middleware.intercept(
+        user,
+        "query_sku_return_rate",
+        {},
+    )
+    assert sku_rate_safe["data_scope"] == "aggregated"
+
 
 def test_aggregated_scope_blocks_unknown_future_tool() -> None:
     """输入：无显式参数；由测试构造固定场景。

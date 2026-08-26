@@ -35,6 +35,7 @@ SCENE_TOOL_MAP: dict[str, ToolWhiteList] = {
             "query_return_stats_nl2sql",
             "get_product_info",
             "query_aftersale_nl2sql",
+            "query_sku_return_rate",
         ),
     ),
     "return_case": ToolWhiteList(
@@ -69,6 +70,7 @@ SCENE_TOOL_MAP: dict[str, ToolWhiteList] = {
         tools=(
             "search_orders",
             "query_return_stats_nl2sql",
+            "query_sku_return_rate",
             "get_product_info",
             "get_order_detail",
             "get_aftersale_workflow",

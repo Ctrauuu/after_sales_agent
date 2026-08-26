@@ -7,7 +7,7 @@ import logging
 from .bridge import make_handler
 from .charting import CHART_TOOL_SCHEMA, handle_chart
 from .mcp_resilience import MCPCallManager
-from .observability import observability
+from . import observability
 from .orchestration import COMPLEX_ANALYSIS_SCHEMA, make_complex_analysis_handler
 from .schemas import TOOL_SPECS
 from .tool_governor import ToolGovernor

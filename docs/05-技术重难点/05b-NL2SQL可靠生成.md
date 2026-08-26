@@ -201,6 +201,7 @@ def run(
 | --- | --- | --- |
 | `query_return_stats_nl2sql` | 是 | 分组维度和统计组合会扩展，属于动态聚合分析 |
 | `query_aftersale_nl2sql` | 是 | 直接承接复杂运营分析和临时统计问题 |
+| `query_sku_return_rate` | 否 | SKU 退单率分母来自订单-SKU 明细，使用固定参数化 SQL 保证口径 |
 | `search_orders` | 否 | 状态、品类、时间等筛选参数明确，固定 SQL 更稳定 |
 | `get_order_detail` | 否 | 按订单 ID 查询，结构固定 |
 | `get_aftersale_workflow` | 否 | 按退单 ID 查询固定流程字段 |
@@ -208,8 +209,8 @@ def run(
 | `query_logistics` | 否 | 按退单 ID 查询物流轨迹，结构固定 |
 | `get_refund_status` | 否 | 按退单 ID 查询退款状态，结构固定 |
 
-“复杂运营数据分析”和“临时统计查询”是 `query_aftersale_nl2sql` 的使用场景，不新增同义 MCP
-Tool，避免 Agent 在多个功能重叠的工具之间误选。
+“复杂运营数据分析”和“临时统计查询”仍由 `query_aftersale_nl2sql` 承接。SKU 退单率是固定核心
+指标，使用 `query_sku_return_rate`，避免模型生成分母和 SQL 安全校验发生偏差。
 
 两个动态工具都位于 `backend/mcp_suning/servers/aftersale.py`：
 
@@ -227,12 +228,13 @@ Tool，避免 Agent 在多个功能重叠的工具之间误选。
 5. 按 `data_scope` 对结果进行统一脱敏。
 
 `query_return_stats_nl2sql` 保持原有列表返回值；`query_aftersale_nl2sql` 返回 `success`、`question`、
-`sql`、`row_count` 和 `rows`。Pipeline 内部保留 EXPLAIN，但两个 MCP 响应都不返回 EXPLAIN。
+`sql`、`row_count` 和 `rows`。`query_sku_return_rate` 返回 `date_range_days`、`row_count` 和 SKU
+退单订单率结果。Pipeline 内部保留 EXPLAIN，但动态 MCP 响应都不返回 EXPLAIN。
 
 ### 7.1 工具注册名必须贯穿调用链
 
-Hermes 通过 `.hermes/plugins/suning-rbac-bridge` 把这两个工具注册到 `suning_business` toolset，调用时
-使用裸名称 `query_return_stats_nl2sql` 和 `query_aftersale_nl2sql`。以下位置必须保持同名：
+Hermes 通过 `.hermes/plugins/suning-rbac-bridge` 把三个售后分析工具注册到 `suning_business` toolset，调用时
+使用裸名称 `query_return_stats_nl2sql`、`query_aftersale_nl2sql` 和 `query_sku_return_rate`。以下位置必须保持同名：
 
 1. 售后 MCP 的 `@mcp.tool`；
 2. 数据库工具注册表；

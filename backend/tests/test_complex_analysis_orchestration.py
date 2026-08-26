@@ -159,10 +159,12 @@ class _FakeLifecycle:
     def launch(self, request: _SubagentLaunchRequest) -> int:
         """输入：待启动的子任务请求 ``request``。
 
-        输出：可回传给等待和结果读取接口的任务序号。
-        功能：记录每个子 Agent 的目标和权限范围，并模拟立即接受启动。
+        输出：可回传给等待和结果读取接口的任务序号；携带单次启动超时时抛出 ``ValueError``。
+        功能：复现 Hermes 禁止 per-launch timeout 的校验，记录合法子 Agent 的目标和权限范围。
         """
 
+        if getattr(request, "timeout_seconds", None) is not None:
+            raise ValueError("Per-launch timeout is not supported")
         self.requests.append(request)
         return len(self.requests) - 1
 
@@ -220,6 +222,40 @@ class _L2DegradedLifecycle(_FakeLifecycle):
         return super().result(handle)
 
 
+class _TimeoutLifecycle(_FakeLifecycle):
+    """始终超时的生命周期替身，用于验证 Harness 的取消职责。"""
+
+    def __init__(self) -> None:
+        """输入：无。
+
+        输出：初始化父类请求记录和取消记录。
+        功能：提供一个不会完成的 Leaf 子 Agent，以覆盖 Harness 的超时终止路径。
+        """
+
+        super().__init__()
+        self.cancelled: list[tuple[int, str]] = []
+
+    def wait(self, handle: int, *, timeout_seconds: float) -> SimpleNamespace:
+        """输入：子 Agent 句柄 ``handle`` 与等待上限 ``timeout_seconds``。
+
+        输出：表示超时的终态对象。
+        功能：模拟子 Agent 超过 Harness 传入的资源上限仍未结束。
+        """
+
+        assert handle == 0
+        assert timeout_seconds > 0
+        return SimpleNamespace(timed_out=True)
+
+    def cancel(self, handle: int, *, reason: str) -> None:
+        """输入：超时子 Agent 句柄 ``handle`` 与取消原因 ``reason``。
+
+        输出：无；保存取消调用。
+        功能：记录 Harness 是否在等待超时时向 Hermes 生命周期请求中断子 Agent。
+        """
+
+        self.cancelled.append((handle, reason))
+
+
 def test_parse_dag_rejects_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
     """输入：pytest 补丁器 ``monkeypatch``。
 
@@ -255,7 +291,10 @@ async def test_orchestrator_executes_dependency_layers_and_aggregates(
     orchestration = _load_orchestration(monkeypatch)
     lifecycle = _FakeLifecycle()
     llm = _FakeLlm()
-    coordinator = orchestration.TaskOrchestrator(llm, lifecycle)
+    coordinator = orchestration.TaskOrchestrator(
+        llm,
+        orchestration.AgentHarness(lifecycle),
+    )
     dag = await coordinator.plan("本月售后全量分析", 30)
 
     await coordinator.run(dag, 30)
@@ -266,16 +305,45 @@ async def test_orchestrator_executes_dependency_layers_and_aggregates(
         ("suning_business",),
         ("suning_business",),
     ]
-    assert "无前置依赖，请自行查询" in lifecycle.requests[0].goal
-    assert "任务 0 的真实查询摘要" in lifecycle.requests[2].goal
-    assert "最多调用一次" in lifecycle.requests[0].goal
+    assert all(not hasattr(request, "timeout_seconds") for request in lifecycle.requests)
+    assert "无前置依赖，请自行查询" in lifecycle.requests[0].context
+    assert "任务 0 的真实查询摘要" in lifecycle.requests[2].context
+    assert "最多调用一次" in lifecycle.requests[0].context
     assert all(task.status is orchestration.TaskStatus.SUCCESS for task in dag.sub_tasks)
+    assert coordinator._harness.snapshot()["statuses"]["healthy"] == 3
     assert dag.planner == "llm"
     assert llm.purposes == [
         "suning_aftersale_dag_planning",
         "suning_aftersale_dag_aggregation",
     ]
     assert report == "聚合报告：数据均来自子任务查询。"
+
+
+@pytest.mark.asyncio
+async def test_harness_cancels_timed_out_leaf_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：pytest 补丁器 ``monkeypatch`` 和始终超时的生命周期替身。
+
+    输出：无；Harness 未取消超时 Leaf 子 Agent 或状态记录错误时由 pytest 报告失败。
+    功能：验证复杂分析的所有子 Agent 经由 Harness 等待，并在超时后统一请求生命周期取消。
+    """
+
+    orchestration = _load_orchestration(monkeypatch)
+    lifecycle = _TimeoutLifecycle()
+    harness = orchestration.AgentHarness(lifecycle)
+
+    with pytest.raises(TimeoutError):
+        await harness.run(
+            task_id="trend",
+            agent_type="trend_analysis",
+            goal="统计趋势",
+            context="只使用业务工具。",
+            timeout_seconds=5,
+        )
+
+    assert lifecycle.cancelled == [(0, "子任务超过时间上限")]
+    assert harness.snapshot()["statuses"]["stopped"] == 1
 
 
 @pytest.mark.asyncio
@@ -291,7 +359,10 @@ async def test_t19_l2_degrade_notice_survives_summary_dependency_and_aggregate(
     orchestration = _load_orchestration(monkeypatch)
     lifecycle = _L2DegradedLifecycle()
     llm = _FakeLlm()
-    coordinator = orchestration.TaskOrchestrator(llm, lifecycle)
+    coordinator = orchestration.TaskOrchestrator(
+        llm,
+        orchestration.AgentHarness(lifecycle),
+    )
     dag = orchestration.TaskDAG(
         "分析退单趋势和原因",
         [
@@ -314,8 +385,8 @@ async def test_t19_l2_degrade_notice_survives_summary_dependency_and_aggregate(
     assert "tool_name=query_return_stats_nl2sql" in degraded_summary
     assert "degrade_level=L2_CORE" in degraded_summary
     assert "当前结果不完整" in degraded_summary
-    assert degraded_summary in lifecycle.requests[1].goal
-    assert "不得改写为‘没有数据’或‘查询结果为空’" in lifecycle.requests[0].goal
+    assert degraded_summary in lifecycle.requests[1].context
+    assert "不得改写为‘没有数据’或‘查询结果为空’" in lifecycle.requests[0].context
 
     _, aggregate_messages = llm.messages[-1]
     assert "L2_CORE" in aggregate_messages[1]["content"]
@@ -348,7 +419,10 @@ async def test_chart_node_reuses_completed_summaries_without_subagent(
         ],
     )
 
-    await orchestration.TaskOrchestrator(_FakeLlm(), lifecycle).run(dag, 30)
+    await orchestration.TaskOrchestrator(
+        _FakeLlm(),
+        orchestration.AgentHarness(lifecycle),
+    ).run(dag, 30)
 
     assert len(lifecycle.requests) == 1
     assert dag.sub_tasks[1].status is orchestration.TaskStatus.SUCCESS
@@ -391,7 +465,10 @@ async def test_aggregate_falls_back_when_outer_timeout_expires(
         ],
     )
 
-    report = await orchestration.TaskOrchestrator(_FakeLlm(), _FakeLifecycle()).aggregate(dag)
+    report = await orchestration.TaskOrchestrator(
+        _FakeLlm(),
+        orchestration.AgentHarness(_FakeLifecycle()),
+    ).aggregate(dag)
 
     assert "聚合模型不可用" in report
 
@@ -416,3 +493,4 @@ async def test_handler_runs_multi_im_analysis(
     assert payload["status"] == "completed"
     assert payload["platform"] == platform
     assert len(lifecycle.requests) == 3
+    assert payload["harness"]["statuses"]["healthy"] == 3
