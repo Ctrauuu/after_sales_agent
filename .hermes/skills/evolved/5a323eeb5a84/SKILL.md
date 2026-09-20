@@ -16,7 +16,7 @@ description: 用于在售后分析流程中估算指定品类/时间窗口的退
   "description": "用于在售后分析流程中估算指定品类/时间窗口的退单退款金额或成本。先检查授权NL2SQL查询工具能力，再调用最匹配的查询工具，按退单原因分组聚合退款金额，并给出总额、原因簇占比和局限说明。",
   "enabled": true,
   "name": "aftersales_return_cost_estimation_by_reason",
-  "output_template": "## 近 {date_range_days} 天退单品类分布（实时查询） **退单最多的品类：{top_category}（{top_count} 单，占 {top_percentage}%）** | 品类 | 退单量 | 占比 | |---|---:|---:| {category_rows} - **{top_category}居首**（{top_count} 单），如需归因细节可继续下钻。",
+  "output_template": "## 近 {date_range_days} 天{category}退单量（实时查询 · 合计 {total} 单） | 日期 | 退单量 | |------|-------:| {row_lines} | **合计** | **{total}** | **要点**： - 近 {date_range_days} 天窗口内{category}退单 **{total} 单**，占全部品类退单的 **{proportion}**，是退单最集中的品类； - 单日峰值在 **{peak_date}（{peak_value} 单）**； - {category}退单主要原因集中在 **{main_reasons}** 等问题； - **数据范围**：受当前账号 RBAC 权限收窄（可访问区域 {region}，城市 {cities}），**非全量口径**；实际返回 {actual_days} 天记录，其余天数无返回数据。金额字段为脱敏（***）。 可继续按**原因**下钻（如“{category}退单的原因分布”）或拉长窗口（{suggested_longer_window} 天）查看趋势。",
   "required_mcp_tools": [
     "query_return_stats_nl2sql"
   ],
@@ -31,17 +31,27 @@ description: 用于在售后分析流程中估算指定品类/时间窗口的退
     "最近{n}天退单最多的品类",
     "按品类统计退单量",
     "退单品类分布",
-    "最近{n}天内哪个品类退单量最大"
+    "最近{n}天内哪个品类退单量最大",
+    "{category}退单量",
+    "{category}退货量",
+    "近{date_range_days}天{category}退单量",
+    "退单量按天统计",
+    "冰箱退单量",
+    "{category}退单趋势",
+    "退单量统计",
+    "退单量按天/按周/按月看",
+    "空调退单量"
   ],
-  "updated_at": "2026-08-25T13:06:52.939704+00:00",
-  "usage_count": 2,
-  "version": 2,
+  "updated_at": "2026-08-28T07:31:36.009580+00:00",
+  "usage_count": 4,
+  "version": 4,
   "workflow": [
     {
-      "output_key": "stats_result",
+      "output_key": "result_1",
       "params": {
+        "category": "{category}",
         "date_range_days": "{date_range_days}",
-        "group_by": "category"
+        "group_by": "{group_by}"
       },
       "step": 1,
       "tool": "query_return_stats_nl2sql"

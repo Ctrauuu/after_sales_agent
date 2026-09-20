@@ -148,11 +148,11 @@ def query_return_stats_nl2sql(
     group_by: str = "category",
     date_range_days: int = 7,
     category: str = "",
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """输入：FastMCP ``ctx``、聚合维度、查询天数和可选品类。
 
-    输出：按退单数量排序且按权限处理的动态聚合统计列表。
-    功能：把结构化统计参数转换为受控问题，并交给共用 NL2SQL Pipeline 查询。
+    输出：包含 RBAC 行级范围、权限说明和按退单数量排序的动态聚合结果。
+    功能：把结构化统计参数交给共用 NL2SQL Pipeline，并显式告知调用方结果是否已被区域、城市或品类权限收窄。
     """
 
     user, safe_filters = authorize_mcp_request(
@@ -186,30 +186,52 @@ def query_return_stats_nl2sql(
         raise ValueError("group_by 必须是 day、category、reason、region 或 brand")
 
     cached = _load_precomputed_return_stats(group_key, safe_filters)
-    if cached is not None:
-        return cached
+    if cached is None:
+        question = (
+            f"统计最近 {safe_filters['date_range_days']} 天的退单数据，"
+            f"{dimensions[group_key]}。"
+            "返回 dimension_code、dimension_name、"
+            "COUNT(DISTINCT r.return_id) AS return_count、"
+            "SUM(r.return_amount) AS total_amount、"
+            "SUM(r.return_amount) / 100.0 AS total_amount_yuan，"
+            "按 return_count 降序。"
+        )
+        requested_category = str(safe_filters.get("category") or "").strip()
+        if requested_category:
+            question += f"只统计品类 {requested_category} 及其子品类。"
 
-    question = (
-        f"统计最近 {safe_filters['date_range_days']} 天的退单数据，"
-        f"{dimensions[group_key]}。"
-        "返回 dimension_code、dimension_name、"
-        "COUNT(DISTINCT r.return_id) AS return_count、"
-        "SUM(r.return_amount) AS total_amount、"
-        "SUM(r.return_amount) / 100.0 AS total_amount_yuan，"
-        "按 return_count 降序。"
-    )
-    requested_category = str(safe_filters.get("category") or "").strip()
-    if requested_category:
-        question += f"只统计品类 {requested_category} 及其子品类。"
+        result = nl2sql_lite_pipeline.run(question, safe_filters)
+        rows = interceptor.mask_sensitive_data(
+            result["rows"],
+            safe_filters["data_scope"],
+        )
+        if getattr(user, "user_id", "") == CRON_SERVICE_USER_ID:
+            _store_precomputed_return_stats(group_key, safe_filters, rows)
+    else:
+        rows = cached
 
-    result = nl2sql_lite_pipeline.run(question, safe_filters)
-    masked = interceptor.mask_sensitive_data(
-        result["rows"],
-        safe_filters["data_scope"],
+    rbac_scope = {
+        "regions": list(safe_filters.get("allowed_regions") or []),
+        "cities": list(safe_filters.get("allowed_cities") or []),
+        "categories": list(safe_filters.get("allowed_categories") or []),
+        "data_scope": safe_filters["data_scope"],
+    }
+    scope_restricted = any(
+        rbac_scope[key] for key in ("regions", "cities", "categories")
     )
-    if getattr(user, "user_id", "") == CRON_SERVICE_USER_ID:
-        _store_precomputed_return_stats(group_key, safe_filters, masked)
-    return masked
+    return {
+        "success": True,
+        "scope_restricted": scope_restricted,
+        "rbac_scope": rbac_scope,
+        "scope_notice": (
+            "RBAC 已按当前账号权限收窄统计范围；结果不是全国数据，"
+            "全国口径需要更高的行级数据权限。"
+            if scope_restricted
+            else "未配置区域、城市或品类行级限制；结果为当前账号授权范围。"
+        ),
+        "row_count": len(rows),
+        "rows": rows,
+    }
 
 
 @mcp.tool(

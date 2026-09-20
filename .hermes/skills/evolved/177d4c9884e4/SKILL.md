@@ -16,10 +16,9 @@ description: 当用户要求分析退单/退货的趋势、主要品类、原因
   "description": "当用户要求分析退单/退货的趋势、主要品类、原因和退款金额并给出图表建议时，自动并联查询退单统计与售后退款明细，生成多维分析结论。",
   "enabled": true,
   "name": "return_refund_multi_dimension_analysis",
-  "output_template": "## 近{date_range_days}天退单综合分析（实时查询） ### ① 按日趋势 {trend_result} ### ② 按品类构成 {category_result} ### ③ 按退单原因 {reason_result} ### ④ 退款金额 {refund_amount_result} ### 结论 1. 趋势：根据按日趋势识别峰值日与走势形态。 2. 品类：根据品类构成识别主导品类及其占比。 3. 原因：根据原因分布识别首要原因及原因簇，结合品类进行归因。 4. 数据覆盖：注明可见数据窗口，避免外推。 ### 图表建议 根据实时返回数据生成趋势图、饼图、条形图。",
+  "output_template": "## 近 {date_range_days} 天{category}品类退单原因分布（实时查询 · 合计 {total_orders} 单） | 原因编码 | 原因 | 退单量 | 占比 | |---|---|---:|---:| {reason_rows} **原因归因要点**： 1. **首要原因**：{primary_reason}（{primary_count} 单，{primary_pct}%） 2. **主要原因簇**：{cluster_analysis} 3. **其他**：{other_analysis} **结论**：{conclusion} > 数据口径：{data_scope_note}",
   "required_mcp_tools": [
-    "query_return_stats_nl2sql",
-    "query_aftersale_nl2sql"
+    "query_return_stats_nl2sql"
   ],
   "skill_id": "177d4c9884e4",
   "trigger_patterns": [
@@ -46,46 +45,26 @@ description: 当用户要求分析退单/退货的趋势、主要品类、原因
     "为什么退单",
     "退货原因分析",
     "退单原因呢",
-    "分析一下退单原因"
+    "分析一下退单原因",
+    "{品类}退单原因是什么",
+    "为什么{品类}退单多",
+    "{品类}退单量按原因分布",
+    "原因呢（在退单分析上下文中）",
+    "原因呢"
   ],
-  "updated_at": "2026-08-25T21:54:24.387992+08:00",
-  "usage_count": 5,
-  "version": 5,
+  "updated_at": "2026-08-28T07:33:56.068213+00:00",
+  "usage_count": 6,
+  "version": 6,
   "workflow": [
     {
-      "output_key": "trend_result",
+      "output_key": "reason_distribution_result",
       "params": {
-        "date_range_days": "{date_range_days}",
-        "group_by": "day"
-      },
-      "step": 1,
-      "tool": "query_return_stats_nl2sql"
-    },
-    {
-      "output_key": "category_result",
-      "params": {
-        "date_range_days": "{date_range_days}",
-        "group_by": "category"
-      },
-      "step": 2,
-      "tool": "query_return_stats_nl2sql"
-    },
-    {
-      "output_key": "reason_result",
-      "params": {
+        "category": "{category}",
         "date_range_days": "{date_range_days}",
         "group_by": "reason"
       },
-      "step": 3,
+      "step": 1,
       "tool": "query_return_stats_nl2sql"
-    },
-    {
-      "output_key": "refund_amount_result",
-      "params": {
-        "question": "近{date_range_days}天退单的退款总金额是多少"
-      },
-      "step": 4,
-      "tool": "query_aftersale_nl2sql"
     }
   ]
 }

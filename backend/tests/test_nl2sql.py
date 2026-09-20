@@ -622,6 +622,8 @@ def test_return_stats_nl2sql_authorizes_then_uses_shared_pipeline(
         "category": "空调",
         "date_range_days": 14,
         "data_scope": "full",
+        "allowed_regions": ["HD"],
+        "allowed_cities": ["NJ", "SH", "HZ", "SZ"],
         "allowed_categories": ["C1-AC"],
     }
 
@@ -682,7 +684,17 @@ def test_return_stats_nl2sql_authorizes_then_uses_shared_pipeline(
     )
 
     assert events == ["authorize:query_return_stats_nl2sql", "pipeline"]
-    assert result == [{"dimension_code": "2026-08-09", "return_count": 3}]
+    assert result["scope_restricted"] is True
+    assert result["rbac_scope"] == {
+        "regions": ["HD"],
+        "cities": ["NJ", "SH", "HZ", "SZ"],
+        "categories": ["C1-AC"],
+        "data_scope": "full",
+    }
+    assert "结果不是全国数据" in result["scope_notice"]
+    assert result["rows"] == [
+        {"dimension_code": "2026-08-09", "return_count": 3}
+    ]
 
 
 def test_aftersale_nl2sql_tool_authorizes_before_pipeline(

@@ -459,6 +459,55 @@ def test_unified_hooks_serialize_cross_platform_turns_before_context_writes(
     assert not [key for key in redis_client.values if key.startswith("im:turn-lease:")]
 
 
+def test_background_review_does_not_hold_user_turn_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """输入：复用父 Session 的 Hermes 后台复盘、同一飞书群的前台请求和共享 Redis。
+
+    输出：无；后台复盘申请租约、阻断内部工具或阻塞前台请求时通过断言报告失败。
+    功能：验证父会话与当前会话相同的内部复盘透传身份 Hook，不与真实用户竞争回合租约。
+    """
+
+    identity, session_values = _load_identity_session(monkeypatch)
+    redis_client = _FakeRedis()
+    router = identity.IdentitySessionRouter(_identity_engine(), redis_client)
+    review_conversation = _RecordingHooks("不应读取")
+    review_hooks = identity.UnifiedIdentityHooks(router, review_conversation)
+    user_conversation = _RecordingHooks("用户上下文")
+    user_hooks = identity.UnifiedIdentityHooks(router, user_conversation)
+    session_values.update(
+        {
+            "HERMES_SESSION_PLATFORM": "feishu",
+            "HERMES_SESSION_USER_ID": "ou_zhang",
+            "HERMES_SESSION_CHAT_TYPE": "group",
+        }
+    )
+
+    review_result = review_hooks.pre_llm_call(
+        session_id="feishu-group-session",
+        parent_session_id="feishu-group-session",
+        user_message="Review the conversation above",
+    )
+
+    assert review_result is None
+    assert review_conversation.pre_calls == []
+    assert review_hooks.pre_tool_call(tool_name="skill_manage") is None
+    assert review_hooks.transform_llm_output(response_text="复盘完成") is None
+    assert not [key for key in redis_client.values if key.startswith("im:turn-lease:")]
+
+    user_result = user_hooks.pre_llm_call(
+        session_id="feishu-group-session",
+        user_message="空调退单原因分布",
+    )
+
+    assert user_result == {"context": "用户上下文"}
+    assert len(user_conversation.pre_calls) == 1
+    user_hooks.post_llm_call(assistant_response="查询结果")
+    review_hooks.post_llm_call(assistant_response="复盘完成")
+    assert review_conversation.post_calls == []
+    assert not [key for key in redis_client.values if key.startswith("im:turn-lease:")]
+
+
 def test_session_end_releases_turn_lease_after_interrupted_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

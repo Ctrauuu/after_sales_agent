@@ -1,3 +1,37 @@
+这个项目是基于Hermes二次开发,部署在企业内部、面向售后/运营团队,同时接入钉钉、飞书、企微等多个即时通讯平台的对话式售后数据分析agent
+常见的应用场景有,在群里去询问昨天退单情况,不需要等BI出报表几秒内就能得到实时数据。用户投诉升级,用一句话就能拉出订单的完整售后链路,不需要去翻阅多个系统。发现某型号退货异常，几轮追问就能定位到具体批次而不需要导excel手动做透视等等。
+
+首先用户在IM平台去给机器人发送自然语言信息,该请求会先经过Hermes gateway,但是不同平台的发送格式是不一样的 我们首先利用Hermes的平台adapter把不同平台格式统一成相同的MessageEvent。
+gateway完成进行平台级处理(平台级鉴权、去重、命令识别以及会话恢复等)，然后通过ContextVar保存可信发送者身份建立可信请求上下文完成第一层鉴权。
+然后进入业务插件,调用pre_llm_call前置钩子去MySQL根据IM账号绑定映射去查表映射成内部逻辑用户(保存对话的类型/逻辑会话id等)，完成第二层鉴权,并通过redis维护跨平台逻辑会话(私聊会通过redis键在30分钟内复用同一逻辑会话,而群聊则是用过ns去隔离群跟用户以及私聊内容)。
+
+pre_llm_call 按以下顺序执行：
+IdentitySessionRouter：校验用户身份，统一不同 IM 平台的用户与会话 ID。
+TurnLease：通过 Redis 获取本轮会话锁，避免同一用户跨平台并发处理。
+Observability：创建本轮 Trace，记录请求链路和用户问题。
+ConversationHooks：提取话题、实体和筛选条件，更新 Redis 短期上下文。
+LongTermMemoryHooks：通过 FTS5 和 Milvus检索该用户的历史业务结论。
+KnowledgeHooks：从售后知识库召回并重排相关政策、法规和业务文档。
+SkillEvolutionHooks：语义匹配已有 Skill，命中后注入可复用的 MCP 工作流。
+ToolGovernor：根据当前话题选择工具白名单，初始化本轮预算并注入工具限制。
+Context 合并：将短期上下文、长期记忆、RAG 知识、Skill 和工具规则合并，注入当前用户消息。
+
+工具调用方式:模型选择工具，Bridge 转发，MCP 服务最终鉴权
+agent选择已经注册的工具,首先检查会话在经过pre_tool_call后的会话状态,然后进行工具治理的硬参数校验(工具是否被禁用、是否在场景下的白名单、参数是否符合schema、有无命中工具结果的缓存、是否超mcp调用预算)
+然后根据gateway中的上下文去得到真实的用户上下文并签发短期HMAC凭证
+接着请求经过bridge转发并建立真实的MCP streamable http请求,并把凭证信息、Otel追踪链路用到的trace id包装在请求里,发送一次mcp tool call。然后在mcp server中去做凭证的验证(签名、签发方与接收方、防重放状态的检测),然后通过用户上下文去mysql中查表得到内部用户的角色权限与用户权限,再与请求范围三者求交集得到最后的范围权限,根据safe_filters生成可用的mysql语句追加到相应的查询语句中,最后根据数据范围进行结果脱敏,工具调用完以后通过工具调用处理器处理超时、重试、熔断、降级并转换成工具消息
+
+post_llm_call 按以下顺序执行：
+RequestState 校验：复用 pre_llm_call 保存的身份与逻辑会话，确认请求未被拒绝、未处于并发等待且仍持有 TurnLease。
+ConversationHooks：保存本轮用户问题和最终回答，更新 Redis 最近对话、回复摘要及历史压缩结果。
+LongTermMemoryHooks：提交异步记忆沉淀任务，从本轮问答中提取可复用业务结论，写入 SQLite FTS5 和 Milvus。
+SkillEvolutionHooks：整理本轮问题、MCP 调用和最终回答；复杂度达到阈值后，异步创建或更新 Skill。
+Observability：用最终回答结束本轮 Trace，并清理未结束的 LLM Span。
+Context 清理：清除身份路由、拒绝状态、并发状态和租约丢失状态等 ContextVar。
+TurnLease 释放：停止续租并释放 Redis 会话锁，允许下一轮或其他 IM 平台继续处理。
+
+
+
 ### 1.IM身份转换成统一用户与逻辑会话
 通过UnifiedIdentityHooks去将所有hook注册到一个统一的身份的hook,将统一身份路由到各个子hook中去
 
@@ -59,7 +93,7 @@ pre_llm_call                          post_llm_call
 长期记忆(解决的是这个用户以前得出过什么业务分析结论？并在以后遇到相似问题时进行召回):
 与短期记忆类似 也是build_memory_hooks()组装然后注册 通过LongTermMemoryHooks的pre/post_llm_call来实现长期记忆
 pre_llm_call:加载上下文得到slot并做处理(移除摘要并将过滤内容分拣为entities+filter的格式),然后交给管道处理得到按融合分数及时间衰减排序的用户私有 TopN 长期记忆,然后最后进行prompt的格式化
-post_llm_call:判断该轮对话有没有值得沉淀结论形成长期记忆的东西(开启后台任务复制本轮快照并立即提交单线程任务,不让该post hooks等待)，根据MemoryExtractor去判断should_record=true/confidence > ?/topic在白名单中/conclusion非空是否满足。
+post_llm_call:判断该轮对话有没有值得沉淀结论形成长期记忆的东西(开启后台任务复制本轮快照并立即提交单线程任务,不让该post hooks等待)，根据MemoryExtractor去判断should_record=true/confidence > ?/topic在白名单中/conclusion非空是否满足。 
 
                  用户发送消息
                       ↓
@@ -547,28 +581,27 @@ DAG Task任务类型 + 节点目标 + 专用prompt + 工具权限 + 前置摘要
 
 ### 11. Agent Skill 自进化闭环
 hermes agent使用一种"经验沉淀 → 技能复用的自进化,本质上是“执行—评估—沉淀—复用”的经验闭环
-
-用户发起任务
-    ↓
-语义匹配已有 Skill
-    ├─ 高置信度命中 → 检查 MCP 依赖 → 注入工作流 → 执行
-    └─ 未命中/依赖缺失 → 交给 LLM 正常规划执行
-    ↓
-记录用户问题、历史轮次、MCP 名称和参数、最终回答
-    ↓
-计算任务复杂度
-    ├─ < 0.4 → 跳过，不沉淀
-    └─ ≥ 0.4 → LLM 抽取通用工作流
-                    ↓
-              Embedding 相似度去重
-                    ├─ > 0.8 → 更新已有 Skill
-                    └─ ≤ 0.8 → 创建新 Skill
-                                    ↓
-                         写入 Hermes SKILL.md
-                                    ↓
-                            刷新语义路由索引
-                                    ↓
-                         后续相似问题直接复用
+   用户发起任务
+      ↓
+   语义匹配已有 Skill
+      ├─ 高置信度命中 → 检查 MCP 依赖 → 注入工作流 → 执行
+      └─ 未命中/依赖缺失 → 交给 LLM 正常规划执行
+      ↓
+   记录用户问题、历史轮次、MCP 名称和参数、最终回答
+      ↓
+   计算任务复杂度
+      ├─ < 0.4 → 跳过，不沉淀
+      └─ ≥ 0.4 → LLM 抽取通用工作流
+                     ↓
+               Embedding 相似度去重
+                     ├─ > 0.8 → 更新已有 Skill
+                     └─ ≤ 0.8 → 创建新 Skill
+                                       ↓
+                           写入 Hermes SKILL.md
+                                       ↓
+                              刷新语义路由索引
+                                       ↓
+                           后续相似问题直接复用
 ==========================================
 自进化模块
    ↓
@@ -853,7 +886,7 @@ total =
 ### 15. Agent 行为控制与 Tools 调用优化
 解决的问题:agent工具滥用，限制agent使用正确的工具并且节省成本
 
-用户信息 -> 识别场景意图 -> 场景工具白名单 -> prompt约束 -> ToolGovernor硬校验 -> MCP Bridge -> 重试/肉高端 -> 结果缓存
+用户信息 -> 识别场景意图 -> 场景工具白名单 -> prompt约束 -> ToolGovernor硬校验 -> MCP Bridge -> 重试 -> 结果缓存
 
 ToolGovernor:工具调用治理,负责控制 Agent 发起的工具调用是否合理、是否需要真的执行，以及执行成功后是否可以缓存。(在插件中注册 在hooks与bridge之间起作用)
 
@@ -1127,7 +1160,7 @@ layer3:模型分层
 先判断任务是否足够简单、明确，简单任务走 Lite 降低延迟和成本，其余请求保守地交给 Full 模型
 
 路由规则:
-complexity > 0.85
+complexity < 0.85
 并且 scene 属于
 return_analysis / order_trace
 或者scene 是simple_query / greeting

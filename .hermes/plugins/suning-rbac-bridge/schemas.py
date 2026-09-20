@@ -100,7 +100,8 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             "name": "query_return_stats_nl2sql",
             "description": (
                 "通过共用 NL2SQL Pipeline，按日期、品类、退单原因、区域或品牌"
-                "动态聚合最近若干天的退单。"
+                "动态聚合最近若干天的退单。必须以返回的 rbac_scope 和 "
+                "scope_notice 为准说明数据范围，不得把受限结果表述为全国数据。"
             ),
             "parameters": {
                 "type": "object",

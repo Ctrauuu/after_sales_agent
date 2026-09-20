@@ -429,6 +429,10 @@ class UnifiedIdentityHooks:
             "suning_identity_session_busy",
             default=False,
         )
+        self._internal_turn: ContextVar[bool] = ContextVar(
+            "suning_identity_session_internal_turn",
+            default=False,
+        )
         self._lease_lost: ContextVar[bool] = ContextVar(
             "suning_identity_session_lease_lost",
             default=False,
@@ -465,12 +469,22 @@ class UnifiedIdentityHooks:
         sender_id: str = "",
         **kwargs: Any,
     ) -> dict[str, str] | None:
-        """输入：Hermes 原始会话、发送者和完整生命周期参数 ``kwargs``。
+        """输入：Hermes 原始会话、发送者和包含父会话的完整生命周期参数 ``kwargs``。
 
-        输出：合并后的短期、长期和知识上下文；身份失败时返回拒绝提示。
-        功能：先解析统一用户与逻辑会话，再以 ``hermes_user_id`` 转发既有回答前 Hooks，拒绝时不读取任何用户数据。
+        输出：合并后的短期、长期和知识上下文；身份失败时返回拒绝提示；内部复盘返回 ``None``。
+        功能：跳过复用父 Session 的后台复盘，其余请求先解析统一用户与逻辑会话，再以 ``hermes_user_id`` 转发既有回答前 Hooks。
         """
 
+        parent_session_id = _text(kwargs.get("parent_session_id"))
+        internal_turn = bool(parent_session_id) and parent_session_id == _text(session_id)
+        self._internal_turn.set(internal_turn)
+        if internal_turn:
+            self._route.set(None)
+            self._denied.set(False)
+            self._busy.set(False)
+            self._lease_lost.set(False)
+            self._turn_lease.set(None)
+            return None
         try:
             route = self._router.resolve(session_id=session_id, sender_id=sender_id)
         except IdentityResolutionError:
@@ -538,11 +552,13 @@ class UnifiedIdentityHooks:
     def transform_llm_output(self, *, response_text: str = "", **_kwargs: Any) -> str | None:
         """输入：模型最终文本 ``response_text`` 与其余 Hermes 输出生命周期字段。
 
-        输出：身份拒绝、并发超时或租约失效时返回固定文案；正常会话返回 ``None`` 保留原回答。
-        功能：在所有工具调用完成后覆盖不可安全执行的回合输出，确保身份校验和跨平台并发控制均默认拒绝。
+        输出：身份拒绝、并发超时或租约失效时返回固定文案；正常会话和内部复盘返回 ``None``。
+        功能：透传内部复盘，并在所有工具调用完成后覆盖其他不可安全执行的回合输出。
         """
 
         del response_text
+        if self._internal_turn.get():
+            return None
         if self._denied.get():
             return UNAUTHORIZED_REPLY
         if self._busy.get():
@@ -554,10 +570,12 @@ class UnifiedIdentityHooks:
     def pre_tool_call(self, *, tool_name: str = "", **kwargs: Any) -> dict[str, str] | None:
         """输入：模型即将调用的工具名 ``tool_name`` 与其余 Hermes 工具生命周期字段。
 
-        输出：身份拒绝、并发超时或租约失效时返回 Hermes ``block`` 指令；正常会话返回 ``None`` 继续执行。
-        功能：在未绑定、并发未获租约或失去所有权时阻断工具副作用，并只为唯一租约所有者记录 Skill 轨迹。
+        输出：身份拒绝、并发超时或租约失效时返回 Hermes ``block`` 指令；正常会话和内部复盘返回 ``None``。
+        功能：透传已由 Hermes 限定工具集的内部复盘，并在其他回合未绑定或失去租约时阻断工具副作用。
         """
 
+        if self._internal_turn.get():
+            return None
         if self._denied.get():
             message = UNAUTHORIZED_REPLY
         elif self._busy.get():
@@ -584,11 +602,16 @@ class UnifiedIdentityHooks:
     def pre_api_request(self, *, api_request_id: str = "", **kwargs: Any) -> None:
         """输入：Hermes 单次模型请求 ID ``api_request_id`` 与其余 API 生命周期字段。
 
-        输出：无；为该 API 请求保存一个未结束的 LLM Span。
-        功能：在真实模型网络请求开始处创建 Span，使 MCP 调用时间不再混入 LLM 耗时。
+        输出：无；为已持有租约的用户 API 请求保存一个未结束的 LLM Span。
+        功能：跳过内部复盘，并在真实模型网络请求开始处创建用户回合 Span。
         """
 
-        if not self._has_turn_lease() or self._observability is None or self._trace.get() is None:
+        if (
+            self._internal_turn.get()
+            or not self._has_turn_lease()
+            or self._observability is None
+            or self._trace.get() is None
+        ):
             return
         key = api_request_id or str(kwargs.get("api_call_count") or "default")
         spans = dict(self._api_spans.get())
@@ -650,8 +673,8 @@ class UnifiedIdentityHooks:
     ) -> None:
         """输入：Hermes 原始会话、可能为空的发送者和完整回答后生命周期参数 ``kwargs``。
 
-        输出：无；唯一租约所有者写入短期上下文并提交长期记忆，其他请求不产生用户数据副作用。
-        功能：复用回答前保存的逻辑会话路由，在释放回合租约前完成持久化，避免跨 IM 并发回合覆盖上下文。
+        输出：无；唯一租约所有者写入短期上下文并提交长期记忆，内部复盘和其他请求不产生用户数据副作用。
+        功能：复用回答前保存的逻辑会话路由，跳过内部复盘，并在释放回合租约前完成用户上下文持久化。
         """
 
         del session_id, sender_id
@@ -683,14 +706,15 @@ class UnifiedIdentityHooks:
             self._route.set(None)
             self._denied.set(False)
             self._busy.set(False)
+            self._internal_turn.set(False)
             self._lease_lost.set(False)
             self._release_turn_lease()
 
     def on_session_end(self, **kwargs: Any) -> None:
         """输入：Hermes 回合结束状态及可选最终回复字段 ``kwargs``。
 
-        输出：无；在失败、中断或正常完成后停止续租并清理本请求状态。
-        功能：覆盖 ``post_llm_call`` 不会触发的异常和中断路径，确保崩溃外的所有回合及时释放统一会话租约。
+        输出：无；在失败、中断或正常完成后停止续租并清理本请求及内部复盘状态。
+        功能：覆盖 ``post_llm_call`` 不会触发的异常和中断路径，确保崩溃外的所有回合及时清理隔离状态并释放统一会话租约。
         """
 
         trace_record = self._trace.get()
@@ -704,6 +728,7 @@ class UnifiedIdentityHooks:
         self._route.set(None)
         self._denied.set(False)
         self._busy.set(False)
+        self._internal_turn.set(False)
         self._lease_lost.set(False)
         self._release_turn_lease()
 
